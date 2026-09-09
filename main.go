@@ -28,7 +28,12 @@ type config struct {
 	lockWait           lockWait
 	logs               bool
 	syncRemote         bool
+	failOnIncomplete   bool
 	noConsistentWrites bool
+	syncFile           string
+	syncFileLocal      string
+	syncFileRemote     string
+	syncPaths          syncFilePaths
 	source             string
 	dest               string
 }
@@ -64,8 +69,8 @@ type syncer struct {
 	source     string
 	dest       string
 	logs       bool
-	useLock    bool
-	generation *generationManager
+	state      *syncState
+	trackState bool
 	logger     *log.Logger
 	runner     commandRunner
 }
@@ -76,9 +81,14 @@ func (s *syncer) Sync(batch map[string]change) error {
 	}
 
 	paths := make([]string, 0, len(batch))
+	full := false
 	for path := range batch {
-		if (s.useLock && path == ".rcw-lock") || (s.generation != nil && path == generationFileName) {
-			continue
+		if s.state != nil {
+			exact, ancestor := s.state.protects(path)
+			if exact {
+				continue
+			}
+			full = full || ancestor
 		}
 		paths = append(paths, path)
 	}
@@ -93,19 +103,31 @@ func (s *syncer) Sync(batch map[string]change) error {
 			s.logger.Printf("sync %q", path)
 		}
 	}
-	if s.generation != nil {
-		if err := s.generation.BeforeRemoteChange(); err != nil {
+	if s.trackState {
+		if err := s.state.BeforeRemoteChange(); err != nil {
 			return fmt.Errorf("advance generation: %w", err)
 		}
 	}
+	complete := func() error {
+		if !s.trackState {
+			return nil
+		}
+		return s.state.AfterRemoteChange()
+	}
 
-	if _, full := batch["."]; full {
+	_, requestedFull := batch["."]
+	if full || requestedFull {
 		args := []string{"sync", s.source, s.dest, "--create-empty-src-dirs"}
-		if s.useLock {
-			args = append(args, "--exclude", "/.rcw-lock")
+		if s.state != nil {
+			for _, filter := range s.state.payloadFilters() {
+				args = append(args, "--exclude", "/"+filter)
+			}
 		}
 		if err := s.run(args...); err != nil {
 			return fmt.Errorf("full sync: %w", err)
+		}
+		if err := complete(); err != nil {
+			return err
 		}
 		if s.logs {
 			s.logger.Printf("sync completed: %d changed path(s)", len(paths))
@@ -150,6 +172,9 @@ func (s *syncer) Sync(batch map[string]change) error {
 		if err := s.run("purge", remotePath(s.dest, path)); err != nil {
 			return fmt.Errorf("delete directory %q: %w", path, err)
 		}
+	}
+	if err := complete(); err != nil {
+		return err
 	}
 
 	if s.logs {
@@ -275,7 +300,7 @@ func run(cfg config) (exitCode int) {
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
 
-	var lock *remoteLock
+	var state *syncState
 	var lockErrors <-chan error
 	if cfg.lockTimeout > 0 {
 		consistentWrites, err := useConsistentWrites(cfg.dest, cfg.noConsistentWrites, runner)
@@ -283,27 +308,29 @@ func run(cfg config) (exitCode int) {
 			fmt.Fprintf(os.Stderr, "rclonewatch: configure lock writes: %v\n", err)
 			return 1
 		}
-		lock = newRemoteLock(cfg.dest, cfg.lockTimeout, cfg.lockWait, consistentWrites, cfg.logs, logger, runner)
-		if err := lock.Acquire(signals); err != nil {
+		state, err = newSyncState(cfg.syncPaths, cfg.source, cfg.dest, cfg.lockTimeout, cfg.lockWait, consistentWrites, cfg.failOnIncomplete, cfg.logs, logger, runner)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "rclonewatch: initialize sync state: %v\n", err)
+			return 1
+		}
+		if err := state.Acquire(signals); err != nil {
 			if errors.Is(err, errLockInterrupted) {
 				return 0
 			}
 			fmt.Fprintf(os.Stderr, "rclonewatch: acquire lock: %v\n", err)
 			return 1
 		}
-		lockErrors = lock.Start()
+		lockErrors = state.Start()
 		defer func() {
-			if err := lock.Close(); err != nil {
+			if err := state.Close(); err != nil {
 				fmt.Fprintf(os.Stderr, "rclonewatch: release lock: %v\n", err)
 				exitCode = 1
 			}
 		}()
 	}
 
-	var generation *generationManager
 	if cfg.syncRemote {
-		generation = newGenerationManager(cfg.source, cfg.dest, cfg.logs, logger, runner)
-		if err := generation.Initialize(); err != nil {
+		if err := state.InitializeGeneration(); err != nil {
 			fmt.Fprintf(os.Stderr, "rclonewatch: initialize generation: %v\n", err)
 			return 1
 		}
@@ -327,8 +354,8 @@ func run(cfg config) (exitCode int) {
 		source:     cfg.source,
 		dest:       cfg.dest,
 		logs:       cfg.logs,
-		useLock:    cfg.lockTimeout > 0,
-		generation: generation,
+		state:      state,
+		trackState: state != nil,
 		logger:     logger,
 		runner:     runner,
 	}
@@ -396,8 +423,11 @@ func run(cfg config) (exitCode int) {
 				eventC = nil
 				continue
 			}
-			if (cfg.lockTimeout > 0 && item.path == ".rcw-lock") || (cfg.syncRemote && item.path == generationFileName) {
-				continue
+			if state != nil {
+				exact, _ := state.protects(item.path)
+				if exact {
+					continue
+				}
 			}
 			addPending(pending, item)
 			if syncReady && !active && !stopping {
@@ -479,11 +509,15 @@ func parseConfig(args []string) (config, error) {
 	flags.SetOutput(io.Discard)
 	var cfg config
 	flags.DurationVar(&cfg.interval, "interval", 0, "time to wait after a successful sync (for example 30s or 5m)")
-	flags.DurationVar(&cfg.lockTimeout, "use-lock", 0, "coordinate using a remote .rcw-lock with this expiry timeout")
+	flags.DurationVar(&cfg.lockTimeout, "use-lock", 0, "coordinate using the remote sync file with this expiry timeout")
 	flags.Var(&cfg.lockWait, "lock-wait", "maximum time to wait for an active lock: 0, a duration using s/m/h, or inf")
 	flags.BoolVar(&cfg.logs, "logs", false, "log sync activity and rclone output to stdout")
 	flags.BoolVar(&cfg.syncRemote, "sync-remote", false, "reconcile a newer remote generation into the local source at startup")
+	flags.BoolVar(&cfg.failOnIncomplete, "fail-on-incomplete-sync", false, "exit if the sync file records an incomplete sync")
 	flags.BoolVar(&cfg.noConsistentWrites, "no-consistent-writes", false, "disable conditional lock writes for S3-compatible destinations")
+	flags.StringVar(&cfg.syncFile, "sync-file", "", "sync file path relative to both source and destination")
+	flags.StringVar(&cfg.syncFileLocal, "sync-file-local", "", "sync file path relative to the local source")
+	flags.StringVar(&cfg.syncFileRemote, "sync-file-remote", "", "sync file path relative to the remote destination")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -492,12 +526,23 @@ func parseConfig(args []string) (config, error) {
 	}
 	lockSet := false
 	lockWaitSet := false
+	syncFileSet := false
+	syncFileLocalSet := false
+	syncFileRemoteSet := false
 	flags.Visit(func(item *flag.Flag) {
 		if item.Name == "use-lock" {
 			lockSet = true
 		}
 		if item.Name == "lock-wait" {
 			lockWaitSet = true
+		}
+		switch item.Name {
+		case "sync-file":
+			syncFileSet = true
+		case "sync-file-local":
+			syncFileLocalSet = true
+		case "sync-file-remote":
+			syncFileRemoteSet = true
 		}
 	})
 	if lockSet && cfg.lockTimeout <= 0 {
@@ -511,6 +556,18 @@ func parseConfig(args []string) (config, error) {
 	}
 	if cfg.noConsistentWrites && !lockSet {
 		return config{}, errors.New("--no-consistent-writes requires --use-lock with a timeout")
+	}
+	if cfg.failOnIncomplete && !lockSet {
+		return config{}, errors.New("--fail-on-incomplete-sync requires --use-lock with a timeout")
+	}
+	if syncFileSet && (syncFileLocalSet || syncFileRemoteSet) {
+		return config{}, errors.New("--sync-file cannot be combined with --sync-file-local or --sync-file-remote")
+	}
+	if syncFileLocalSet != syncFileRemoteSet {
+		return config{}, errors.New("--sync-file-local and --sync-file-remote must be specified together")
+	}
+	if (syncFileSet || syncFileLocalSet) && !lockSet {
+		return config{}, errors.New("sync file path options require --use-lock with a timeout")
 	}
 	if flags.NArg() != 2 {
 		return config{}, errors.New("expected a source folder and rclone destination")
@@ -529,6 +586,18 @@ func parseConfig(args []string) (config, error) {
 	}
 	cfg.source = source
 	cfg.dest = flags.Arg(1)
+	if lockSet {
+		localRelative, remoteRelative := defaultSyncFile, defaultSyncFile
+		if syncFileSet {
+			localRelative, remoteRelative = cfg.syncFile, cfg.syncFile
+		} else if syncFileLocalSet {
+			localRelative, remoteRelative = cfg.syncFileLocal, cfg.syncFileRemote
+		}
+		cfg.syncPaths, err = resolveSyncFilePaths(cfg.source, cfg.dest, localRelative, remoteRelative)
+		if err != nil {
+			return config{}, fmt.Errorf("resolve sync file paths: %w", err)
+		}
+	}
 	return cfg, nil
 }
 

@@ -183,21 +183,42 @@ func TestAddPendingRequestsFullSyncForTypeChange(t *testing.T) {
 	}
 }
 
-func TestFullSyncExcludesLockFile(t *testing.T) {
+func TestFullSyncExcludesSyncFiles(t *testing.T) {
 	runner := &recordingRunner{}
 	s := syncer{
-		source:  t.TempDir(),
-		dest:    "remote:backup",
-		useLock: true,
-		logger:  log.New(io.Discard, "", 0),
-		runner:  runner,
+		source: t.TempDir(),
+		dest:   "remote:backup",
+		state: &syncState{paths: syncFilePaths{
+			localFilter:  ".local/state.json",
+			remoteFilter: ".remote/state.json",
+		}},
+		logger: log.New(io.Discard, "", 0),
+		runner: runner,
 	}
 	if err := s.Sync(map[string]change{".": {path: ".", isDir: true}}); err != nil {
 		t.Fatal(err)
 	}
 	args := runner.commands[0].args
-	if !reflect.DeepEqual(args[len(args)-2:], []string{"--exclude", "/.rcw-lock"}) {
-		t.Fatalf("full sync args = %#v, want lock exclusion", args)
+	want := []string{"--exclude", "/.local/state.json", "--exclude", "/.remote/state.json"}
+	if !reflect.DeepEqual(args[len(args)-4:], want) {
+		t.Fatalf("full sync args = %#v, want sync-file exclusions %#v", args, want)
+	}
+}
+
+func TestSyncFileAncestorForcesFilteredFullSync(t *testing.T) {
+	runner := &recordingRunner{}
+	s := syncer{
+		source: t.TempDir(),
+		dest:   "remote:backup",
+		state:  &syncState{paths: syncFilePaths{localFilter: ".metadata/state.json"}},
+		logger: log.New(io.Discard, "", 0),
+		runner: runner,
+	}
+	if err := s.Sync(map[string]change{".metadata": {path: ".metadata", isDir: true, removed: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.commands[0].args[0]; got != "sync" {
+		t.Fatalf("command = %q, want filtered full sync", got)
 	}
 }
 
@@ -208,9 +229,7 @@ func TestFinalSyncOnSIGTERM(t *testing.T) {
 	source := t.TempDir()
 	destination := t.TempDir()
 	process := startTestProcess(t, "--use-lock", "2s", "--sync-remote", "--logs", source, destination)
-	if _, err := os.Stat(filepath.Join(destination, ".rcw-lock")); err != nil {
-		t.Fatalf("remote lock was not created: %v", err)
-	}
+	assertSyncState(t, filepath.Join(destination, defaultSyncFile), 1, false, true)
 
 	if err := os.WriteFile(filepath.Join(source, "final.txt"), []byte("final contents"), 0o600); err != nil {
 		t.Fatal(err)
@@ -225,11 +244,8 @@ func TestFinalSyncOnSIGTERM(t *testing.T) {
 	if err != nil || string(contents) != "final contents" {
 		t.Fatalf("final synced contents = %q, err = %v", contents, err)
 	}
-	if _, err := os.Stat(filepath.Join(destination, ".rcw-lock")); !os.IsNotExist(err) {
-		t.Fatalf("remote lock remains after exit: %v", err)
-	}
-	assertGeneration(t, filepath.Join(source, generationFileName), 2)
-	assertGeneration(t, filepath.Join(destination, generationFileName), 2)
+	assertSyncState(t, filepath.Join(source, defaultSyncFile), 2, false, false)
+	assertSyncState(t, filepath.Join(destination, defaultSyncFile), 2, false, false)
 }
 
 func TestIntervalSync(t *testing.T) {
@@ -255,9 +271,18 @@ func TestIntervalSync(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	time.Sleep(200 * time.Millisecond)
-	assertGeneration(t, filepath.Join(source, generationFileName), 2)
-	assertGeneration(t, filepath.Join(destination, generationFileName), 2)
+	for {
+		local, localExists, localErr := readLocalSyncFile(filepath.Join(source, defaultSyncFile))
+		remote, remoteExists, remoteErr := readLocalSyncFile(filepath.Join(destination, defaultSyncFile))
+		if localErr == nil && remoteErr == nil && localExists && remoteExists && local.Generation >= 2 && local.Generation == remote.Generation && !local.Syncing && !remote.Syncing && remote.Lock != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			process.cmd.Process.Kill()
+			t.Fatalf("sync state did not settle: local=%#v exists=%v err=%v remote=%#v exists=%v err=%v", local, localExists, localErr, remote, remoteExists, remoteErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if err := process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -294,12 +319,16 @@ func TestLostLockExitsWithoutSyncing(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "must-not-sync.txt"), []byte("contents"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	foreign := time.Now().UTC().Format(time.RFC3339Nano) + "\n"
-	if err := os.WriteFile(filepath.Join(destination, ".rcw-lock"), []byte(foreign), 0o600); err != nil {
+	foreign := syncFileData{Generation: 1, Lock: &syncFileLock{Owner: "foreign", Timestamp: time.Now().UTC()}}
+	contents, err := encodeSyncFile(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, defaultSyncFile), contents, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	err := process.waitForExit(t)
+	err = process.waitForExit(t)
 	var exitError *exec.ExitError
 	if !errors.As(err, &exitError) || exitError.ExitCode() != 1 {
 		t.Fatalf("process exit = %v, want status 1; stderr: %s", err, process.stderr.String())
@@ -307,9 +336,9 @@ func TestLostLockExitsWithoutSyncing(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(destination, "must-not-sync.txt")); !os.IsNotExist(err) {
 		t.Fatalf("file was synced after lock ownership was lost: %v", err)
 	}
-	contents, err := os.ReadFile(filepath.Join(destination, ".rcw-lock"))
-	if err != nil || string(contents) != foreign {
-		t.Fatalf("foreign lock was changed or removed: contents=%q err=%v", contents, err)
+	got, exists, err := readLocalSyncFile(filepath.Join(destination, defaultSyncFile))
+	if err != nil || !exists || got.Lock == nil || got.Lock.Owner != "foreign" {
+		t.Fatalf("foreign lock was changed or removed: state=%#v exists=%v err=%v", got, exists, err)
 	}
 }
 
@@ -333,6 +362,8 @@ func TestParseConfigRequiresLockForLockOptions(t *testing.T) {
 	for _, args := range [][]string{
 		{"--lock-wait", "1m", source, "remote:destination"},
 		{"--no-consistent-writes", source, "remote:destination"},
+		{"--fail-on-incomplete-sync", source, "remote:destination"},
+		{"--sync-file", "state.json", source, "remote:destination"},
 	} {
 		if _, err := parseConfig(args); err == nil {
 			t.Fatalf("options %#v were accepted without --use-lock", args)
@@ -344,6 +375,35 @@ func TestParseConfigRequiresLockForLockOptions(t *testing.T) {
 	}
 	if !cfg.lockWait.infinite {
 		t.Fatal("--lock-wait inf was not retained")
+	}
+}
+
+func TestParseConfigSyncFileOptions(t *testing.T) {
+	source := t.TempDir()
+	tests := [][]string{
+		{"--use-lock", "1m", "--sync-file", "one", "--sync-file-local", "two", "--sync-file-remote", "three", source, "remote:destination"},
+		{"--use-lock", "1m", "--sync-file-local", "two", source, "remote:destination"},
+		{"--use-lock", "1m", "--sync-file-remote", "three", source, "remote:destination"},
+		{"--use-lock", "1m", "--sync-remote", "--fail-on-incomplete-sync", "--sync-file", "/absolute", source, "remote:destination"},
+	}
+	for _, args := range tests {
+		if _, err := parseConfig(args); err == nil {
+			t.Fatalf("invalid options %#v were accepted", args)
+		}
+	}
+
+	cfg, err := parseConfig([]string{"--use-lock", "1m", "--sync-remote", "--fail-on-incomplete-sync", "--sync-file-local", "../local-state", "--sync-file-remote", "../remote-state", source, "remote:destination/root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.syncPaths.local != filepath.Join(filepath.Dir(source), "local-state") || cfg.syncPaths.localFilter != "" {
+		t.Fatalf("local sync path = %#v", cfg.syncPaths)
+	}
+	if cfg.syncPaths.remote != "remote:destination/remote-state" || cfg.syncPaths.remoteFilter != "" {
+		t.Fatalf("remote sync path = %#v", cfg.syncPaths)
+	}
+	if _, err := parseConfig([]string{"--use-lock", "1m", "--fail-on-incomplete-sync", source, "remote:destination"}); err != nil {
+		t.Fatalf("--fail-on-incomplete-sync unexpectedly required --sync-remote: %v", err)
 	}
 }
 
