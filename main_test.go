@@ -411,6 +411,9 @@ func TestParseConfigRequiresLockForRemoteSync(t *testing.T) {
 	if _, err := parseConfig([]string{"--reconcile-remote-changes", t.TempDir(), "remote:destination"}); err == nil {
 		t.Fatal("--reconcile-remote-changes without --use-lock was accepted")
 	}
+	if _, err := parseConfig([]string{"--force-delete-untracked-remote", t.TempDir(), "remote:destination"}); err == nil {
+		t.Fatal("--force-delete-untracked-remote without --use-lock was accepted")
+	}
 }
 
 func TestParseConfigRejectsRenamedOptions(t *testing.T) {

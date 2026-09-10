@@ -27,12 +27,20 @@ type memorySyncRunner struct {
 	payloadRan          bool
 	requireGeneration   uint64
 	requireSyncing      bool
+	remoteFiles         bool
 }
 
 func (r *memorySyncRunner) Run(args []string, stdout, stderr io.Writer) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch args[0] {
+	case "lsjson":
+		if r.remoteFiles {
+			_, err := io.WriteString(stdout, `[{"Path":"existing.txt","IsDir":false}]`)
+			return err
+		}
+		_, err := io.WriteString(stdout, "[]")
+		return err
 	case "cat":
 		if r.value == "" {
 			return exec.Command("sh", "-c", "exit 4").Run()
@@ -146,11 +154,15 @@ func TestSyncStateLifecycleWithLocalRclone(t *testing.T) {
 	if err := state.Acquire(make(chan os.Signal)); err != nil {
 		t.Fatal(err)
 	}
+	state.Start()
+	if err := state.InitializeRemote(); err != nil {
+		t.Fatal(err)
+	}
 	initial, _, err := readLocalSyncFile(paths.remote)
 	if err != nil || initial.Lock == nil {
 		t.Fatalf("initial remote state = %#v, err = %v", initial, err)
 	}
-	errors := state.Start()
+	errors := state.errors
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -402,6 +414,59 @@ func TestFailOnIncompleteBeforeRemoteWrite(t *testing.T) {
 	}
 }
 
+func TestUntrackedRemoteRequiresForce(t *testing.T) {
+	runner := &memorySyncRunner{remoteFiles: true}
+	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
+	err := state.Acquire(make(chan os.Signal))
+	if err == nil || !strings.Contains(err.Error(), "--force-delete-untracked-remote") {
+		t.Fatalf("Acquire error = %v, want force-delete error", err)
+	}
+	if got := runner.writes(); got != 0 {
+		t.Fatalf("remote state writes = %d, want 0", got)
+	}
+}
+
+func TestEmptyRemoteAcquiresInitializationLock(t *testing.T) {
+	runner := &memorySyncRunner{}
+	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	remote := runner.data(t)
+	if remote.Generation != 0 || remote.Lock == nil || remote.Lock.Owner != state.owner {
+		t.Fatalf("initial remote state = %#v, want owned generation 0", remote)
+	}
+	state.Start()
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGenerationZeroRetriesInitialization(t *testing.T) {
+	runner := &memorySyncRunner{}
+	runner.setData(syncFileData{Generation: 0})
+	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	state.Start()
+	runner.payloadErr = errors.New("initial sync failed")
+	if err := state.InitializeRemote(); err == nil {
+		t.Fatal("initialization failure was ignored")
+	}
+	runner.payloadErr = nil
+	if err := state.InitializeRemote(); err != nil {
+		t.Fatal(err)
+	}
+	if remote := runner.data(t); remote.Generation != 1 || remote.Lock == nil {
+		t.Fatalf("remote state after retry = %#v, want locked generation 1", remote)
+	}
+	assertSyncState(t, state.paths.local, 1, false, false)
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSyncStateRecoversUnpublishedLocalGeneration(t *testing.T) {
 	runner := &memorySyncRunner{}
 	runner.setData(syncFileData{Generation: 4})
@@ -517,23 +582,54 @@ func TestSyncFromRemoteAppliesExcludes(t *testing.T) {
 
 func TestSyncStateInitializeGeneration(t *testing.T) {
 	requireRclone(t)
-	t.Run("absent", func(t *testing.T) {
+	t.Run("both absent initializes from local", func(t *testing.T) {
 		source := t.TempDir()
 		destination := t.TempDir()
 		writeTestFile(t, filepath.Join(source, "local-only.txt"), "local")
-		writeTestFile(t, filepath.Join(destination, "remote.txt"), "remote")
 		state := acquireLocalState(t, source, destination)
 		if err := state.InitializeGeneration(); err != nil {
 			t.Fatal(err)
 		}
-		if got := readTestFile(t, filepath.Join(source, "remote.txt")); got != "remote" {
-			t.Fatalf("remote content = %q, want remote", got)
+		if got := readTestFile(t, filepath.Join(destination, "local-only.txt")); got != "local" {
+			t.Fatalf("local content synced remotely = %q, want local", got)
 		}
-		if _, err := os.Stat(filepath.Join(source, "local-only.txt")); !os.IsNotExist(err) {
-			t.Fatalf("local-only file remains after remote sync: %v", err)
+		if got := readTestFile(t, filepath.Join(source, "local-only.txt")); got != "local" {
+			t.Fatalf("local content = %q, want local", got)
 		}
 		assertSyncState(t, state.paths.local, 1, false, false)
 		state.Start()
+		if err := state.Close(); err != nil {
+			t.Fatal(err)
+		}
+		assertSyncState(t, state.paths.remote, 1, false, false)
+	})
+
+	t.Run("forced non-empty initialization", func(t *testing.T) {
+		source := t.TempDir()
+		destination := t.TempDir()
+		writeTestFile(t, filepath.Join(source, "local.txt"), "local")
+		writeTestFile(t, filepath.Join(source, "excluded.tmp"), "excluded")
+		writeTestFile(t, filepath.Join(destination, "remote-only.tmp"), "remote")
+		state := newLocalState(t, source, destination)
+		state.forceDeleteUntrackedRemote = true
+		state.excludes = []string{"*.tmp"}
+		if err := state.Acquire(make(chan os.Signal)); err != nil {
+			t.Fatal(err)
+		}
+		state.Start()
+		if err := state.InitializeRemote(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(destination, "remote-only.tmp")); !os.IsNotExist(err) {
+			t.Fatalf("untracked remote file remains: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(destination, "excluded.tmp")); !os.IsNotExist(err) {
+			t.Fatalf("excluded local file was synced: %v", err)
+		}
+		if got := readTestFile(t, filepath.Join(destination, "local.txt")); got != "local" {
+			t.Fatalf("initialized remote content = %q, want local", got)
+		}
+		assertSyncState(t, state.paths.local, 1, false, false)
 		if err := state.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -594,7 +690,6 @@ func TestSyncStateRejectsInvalidGenerationOrdering(t *testing.T) {
 		wantError  string
 		makeRemote bool
 	}{
-		{name: "local only", local: 1, wantError: "remote state file is missing"},
 		{name: "local ahead", local: 2, remote: 1, makeRemote: true, wantError: "ahead of remote"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -650,15 +745,22 @@ func activeForeignState() syncFileData {
 
 func acquireLocalState(t *testing.T, source, destination string) *syncState {
 	t.Helper()
+	state := newLocalState(t, source, destination)
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	state.Start()
+	return state
+}
+
+func newLocalState(t *testing.T, source, destination string) *syncState {
+	t.Helper()
 	paths, err := resolveSyncFilePaths(source, destination, defaultStateFile, defaultStateFile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	state, err := newSyncState(paths, source, destination, time.Hour, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{}, "")
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := state.Acquire(make(chan os.Signal)); err != nil {
 		t.Fatal(err)
 	}
 	return state

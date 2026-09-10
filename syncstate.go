@@ -38,20 +38,21 @@ type remoteSyncFile struct {
 }
 
 type syncState struct {
-	paths            syncFilePaths
-	source           string
-	dest             string
-	timeout          time.Duration
-	wait             lockWait
-	pollInterval     time.Duration
-	consistentWrites bool
-	failOnIncomplete bool
-	logs             bool
-	logger           *log.Logger
-	runner           commandRunner
-	owner            string
-	persistent       bool
-	excludes         []string
+	paths                      syncFilePaths
+	source                     string
+	dest                       string
+	timeout                    time.Duration
+	wait                       lockWait
+	pollInterval               time.Duration
+	consistentWrites           bool
+	failOnIncomplete           bool
+	logs                       bool
+	logger                     *log.Logger
+	runner                     commandRunner
+	owner                      string
+	persistent                 bool
+	excludes                   []string
+	forceDeleteUntrackedRemote bool
 
 	mu         sync.Mutex
 	updateMu   sync.Mutex
@@ -105,11 +106,17 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 	if s.failOnIncomplete && ((localExists && local.Syncing) || (remote.exists && remote.data.Syncing)) {
 		return errors.New("state file indicates an incomplete previous sync")
 	}
-	if localExists && !remote.exists {
-		return errors.New("local state file exists but remote state file is missing")
+	if !remote.exists && !s.forceDeleteUntrackedRemote {
+		empty, err := s.remotePayloadEmpty()
+		if err != nil {
+			return fmt.Errorf("inspect untracked remote destination: %w", err)
+		}
+		if !empty {
+			return errors.New("remote destination has no state file and is not empty; use --force-delete-untracked-remote to delete its contents and initialize it")
+		}
 	}
 	localIncompleteAdvance := localExists && remote.exists && local.Syncing && local.Generation == remote.data.Generation+1
-	if localExists && local.Generation > remote.data.Generation && !localIncompleteAdvance {
+	if remote.exists && remote.data.Generation > 0 && localExists && local.Generation > remote.data.Generation && !localIncompleteAdvance {
 		return fmt.Errorf("local generation %d is ahead of remote generation %d", local.Generation, remote.data.Generation)
 	}
 	if s.persistent && remote.ownedBy(s.owner) {
@@ -184,9 +191,6 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 		}
 
 		candidate := remote.data
-		if !remote.exists {
-			candidate.Generation = 1
-		}
 		candidate.Lock = &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC()}
 		if err := s.writeRemote(candidate, remote.etag); err != nil {
 			if s.consistentWrites && canWait {
@@ -226,7 +230,44 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 	}
 }
 
+func (s *syncState) InitializeRemote() error {
+	remote := s.getRemote()
+	if remote.data.Generation != 0 {
+		return nil
+	}
+	if s.logs {
+		s.logger.Printf("remote repository is uninitialized; syncing local to remote")
+	}
+	if err := s.deleteRemotePayload(); err != nil {
+		return fmt.Errorf("clear untracked remote payload: %w", err)
+	}
+	if err := s.syncToRemote(); err != nil {
+		return fmt.Errorf("initial local-to-remote sync: %w", err)
+	}
+
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	remote = s.getRemote()
+	candidate := remote.data
+	candidate.Generation = 1
+	candidate.Syncing = false
+	candidate.Lock = &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC()}
+	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
+		return fmt.Errorf("complete remote initialization: %w", err)
+	}
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: 1}); err != nil {
+		return fmt.Errorf("write initial local state: %w", err)
+	}
+	if s.logs {
+		s.logger.Printf("remote repository initialized at generation 1")
+	}
+	return nil
+}
+
 func (s *syncState) InitializeGeneration() error {
+	if err := s.InitializeRemote(); err != nil {
+		return err
+	}
 	local, localExists, err := readLocalSyncFile(s.paths.local)
 	if err != nil {
 		return err
@@ -272,6 +313,9 @@ func (s *syncState) BeforeRemoteChange() error {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
 	remote := s.getRemote()
+	if remote.data.Generation == 0 {
+		return errors.New("remote repository is not initialized")
+	}
 	if remote.data.Generation == ^uint64(0) {
 		return errors.New("generation number cannot be incremented")
 	}
@@ -409,6 +453,40 @@ func (s *syncState) syncFromRemote() error {
 	return s.run(args...)
 }
 
+func (s *syncState) syncToRemote() error {
+	args := []string{"sync", s.source, s.dest, "--create-empty-src-dirs"}
+	for _, filter := range s.payloadFilters() {
+		args = append(args, "--exclude", "/"+filter)
+	}
+	for _, pattern := range s.excludes {
+		args = append(args, "--exclude", pattern)
+	}
+	return s.run(args...)
+}
+
+func (s *syncState) deleteRemotePayload() error {
+	args := []string{"delete", s.dest, "--rmdirs"}
+	if s.paths.remoteFilter != "" {
+		args = append(args, "--exclude", "/"+s.paths.remoteFilter)
+	}
+	return s.run(args...)
+}
+
+func (s *syncState) remotePayloadEmpty() (bool, error) {
+	var stdout, stderr bytes.Buffer
+	if err := s.runner.Run([]string{"lsjson", s.dest, "--recursive"}, &stdout, &stderr); err != nil {
+		if isRcloneNotFound(err) {
+			return true, nil
+		}
+		return false, commandError(err, stderr.String())
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		return false, fmt.Errorf("decode remote listing: %w", err)
+	}
+	return len(entries) == 0, nil
+}
+
 func (s *syncState) payloadFilters() []string {
 	filters := make([]string, 0, 2)
 	if s.paths.localFilter != "" {
@@ -544,10 +622,16 @@ func readLocalSyncFile(path string) (syncFileData, bool, error) {
 	if err != nil {
 		return syncFileData{}, false, fmt.Errorf("invalid local state file: %w", err)
 	}
+	if data.Generation == 0 {
+		return syncFileData{}, false, errors.New("invalid local state file: generation must be at least 1")
+	}
 	return data, true, nil
 }
 
 func writeLocalSyncFile(path string, data syncFileData) error {
+	if data.Generation == 0 {
+		return errors.New("generation must be at least 1")
+	}
 	contents, err := encodeSyncFile(data)
 	if err != nil {
 		return err
@@ -559,9 +643,6 @@ func writeLocalSyncFile(path string, data syncFileData) error {
 }
 
 func encodeSyncFile(data syncFileData) ([]byte, error) {
-	if data.Generation == 0 {
-		return nil, errors.New("generation must be at least 1")
-	}
 	contents, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return nil, err
@@ -575,9 +656,6 @@ func decodeSyncFile(contents []byte) (syncFileData, error) {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&data); err != nil {
 		return syncFileData{}, err
-	}
-	if data.Generation == 0 {
-		return syncFileData{}, errors.New("generation must be at least 1")
 	}
 	if data.Lock != nil && (data.Lock.Owner == "" || data.Lock.Timestamp.IsZero()) {
 		return syncFileData{}, errors.New("lock owner and timestamp must be set")

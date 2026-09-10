@@ -30,6 +30,7 @@ type config struct {
 	excludes           excludePatterns
 	logs               bool
 	reconcileRemote    bool
+	forceDeleteRemote  bool
 	failOnIncomplete   bool
 	noConsistentWrites bool
 	stateFile          string
@@ -338,6 +339,7 @@ func run(cfg config) (exitCode int) {
 			return 1
 		}
 		state.excludes = append([]string(nil), cfg.excludes...)
+		state.forceDeleteUntrackedRemote = cfg.forceDeleteRemote
 		if err := state.Acquire(signals); err != nil {
 			if errors.Is(err, errLockInterrupted) {
 				return 0
@@ -354,15 +356,24 @@ func run(cfg config) (exitCode int) {
 		}()
 	}
 
+	if state != nil {
+		if err := state.InitializeRemote(); err != nil {
+			logger.Printf("initialize remote repository: %v", err)
+			return 1
+		}
+	}
+
 	if cfg.reconcileRemote {
 		if err := state.InitializeGeneration(); err != nil {
 			logger.Printf("initialize generation: %v", err)
 			return 1
 		}
+	}
+	if state != nil {
 		select {
 		case err := <-lockErrors:
 			if err != nil {
-				logger.Printf("lock refresh failed during generation sync: %v", err)
+				logger.Printf("lock refresh failed during startup sync: %v", err)
 				return 1
 			}
 		default:
@@ -593,6 +604,7 @@ func parseConfig(args []string) (config, error) {
 	flags.Var(&cfg.excludes, "exclude", "exclude files matching this rclone glob (repeatable)")
 	flags.BoolVar(&cfg.logs, "logs", false, "log sync activity and rclone output to stdout")
 	flags.BoolVar(&cfg.reconcileRemote, "reconcile-remote-changes", false, "reconcile a newer remote generation into the local source at startup")
+	flags.BoolVar(&cfg.forceDeleteRemote, "force-delete-untracked-remote", false, "delete and initialize a non-empty destination without a state file")
 	flags.BoolVar(&cfg.failOnIncomplete, "fail-on-incomplete-sync", false, "exit if the state file records an incomplete sync")
 	flags.BoolVar(&cfg.noConsistentWrites, "no-consistent-writes", false, "disable conditional lock writes for S3-compatible destinations")
 	flags.StringVar(&cfg.stateFile, "state-file", "", "state file path relative to both source and destination")
@@ -634,6 +646,9 @@ func parseConfig(args []string) (config, error) {
 	}
 	if cfg.reconcileRemote && !lockSet {
 		return config{}, errors.New("--reconcile-remote-changes requires --use-lock with a timeout")
+	}
+	if cfg.forceDeleteRemote && !lockSet {
+		return config{}, errors.New("--force-delete-untracked-remote requires --use-lock with a timeout")
 	}
 	if lockWaitSet && !lockSet {
 		return config{}, errors.New("--lock-wait requires --use-lock with a timeout")

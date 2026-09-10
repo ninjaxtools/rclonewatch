@@ -55,6 +55,11 @@ Options:
         sync runs only when the remote generation is newer or local state is
         absent.
 
+  --force-delete-untracked-remote
+        Initialize a non-empty destination that has no .rcw-state file by
+        deleting its existing payload and fully syncing local to remote.
+        Requires --use-lock.
+
   --fail-on-incomplete-sync
         Exit with status 1 before lock acquisition or remote writes when the
         local or remote .rcw-state has syncing set to true. Requires --use-lock.
@@ -86,14 +91,16 @@ Wrapped command:
 State file behavior:
   .rcw-state combines the persistent generation, incomplete-sync flag, and
   optional lock owner/timestamp. Unlocking clears the lock fields but does not
-  delete the file. If local state is absent or older,
+  delete the file. A destination without remote state must be empty unless
+  --force-delete-untracked-remote is supplied. Initialization locks remote
+  generation 0, clears its payload, fully syncs local to remote, then promotes
+  both state files to generation 1. If local state is absent or older,
   --reconcile-remote-changes performs a full remote-to-local sync. Equal
-  generations skip it. A missing remote state when local state exists, or a
-  completed local generation ahead of remote, is an error. Before each outgoing
-  batch, generation is incremented and syncing is set true on both sides before
-  payload changes. It is cleared only after the entire batch succeeds, so
-  failures remain detectable on the next run. A required remote-to-local sync
-  deletes local payload absent remotely.
+  generations skip it. A completed local generation ahead of remote is an
+  error. Before each outgoing batch, generation is incremented and syncing is
+  set true on both sides before payload changes. It is cleared only after the
+  entire batch succeeds, so failures remain detectable on the next run. A
+  required remote-to-local sync deletes local payload absent remotely.
 
   State paths inside either payload root are excluded from payload transfers.
   When local and remote paths differ, both relative names are reserved.
