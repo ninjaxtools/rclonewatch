@@ -1,15 +1,17 @@
 # rclonewatch
 
-`rclonewatch` watches a local directory recursively with Linux inotify and syncs changed paths to an rclone destination.
+`rclonewatch` watches a local directory recursively with Linux inotify and syncs changes with an rclone destination.
 
 The most common mode of operation wraps a program that changes the watched directory. In the following example `./build.sh` is executed through rclonewatch, and changes are synced every 30 seconds (`--interval 30s`), excluding temporary files (`--exclude '*.tmp'`), and a final sync runs after the command exits.
 
 ```sh
-./rclonewatch --interval 30s --use-lock 2m --reconcile-remote-changes --exclude '*.tmp' --logs \
+./rclonewatch --interval 30s --use-lock 2m --exclude '*.tmp' --logs \
   /srv/data remote:backup/data -- ./build.sh --release
 ```
 
 The command is optional and if not provided rclonewatch keeps running until an interrupt is sent to the process which will cause a clean shutdown with a final sync.
+
+Any changes to the watched directory, whether made by a wrapped program or not are synchronised. If the remote directory does not have a state file, a full local to remote sync is performed first. If a remote state file exists and its generatino is ahead of the local state file, then a full remote to local sync is performed to reconcile the local directory with any remote changes performed from another location.
 
 ## Installation
 
@@ -53,12 +55,11 @@ Arguments:
 - `SOURCE_FOLDER` is an existing local directory.
 - `RCLONE_DESTINATION` is any destination accepted by rclone.
 - `--interval DURATION` waits that long after each successful sync before starting another. Failed syncs retry with exponential backoff from 1 second to 1 minute. With no interval, changes are synced only during shutdown.
-- `--use-lock TIMEOUT` coordinates access through the persistent `.rcw-state` JSON file. Its lock timestamp is refreshed at half the timeout.
+- `--use-lock TIMEOUT` coordinates access through the persistent `.rcw-state` JSON file and always reconciles remote generations at startup. Its lock timestamp is refreshed at half the timeout.
 - `--lock-wait 0|DURATION|inf` controls how long startup follows an active lock. By default, startup waits for the observed lock to expire but fails if it is refreshed. An explicit `0` exits immediately; durations use `s`, `m`, and `h`; `inf` waits indefinitely.
 - `--persistent-lock ID` uses `ID` as the lock owner and retains the lock on exit. A later invocation with the same ID continues it immediately, refreshing it first only when half the timeout has elapsed. It requires `--use-lock`.
-- `--exclude GLOB` excludes files matching an [rclone filter glob](https://rclone.org/filtering/). Repeat the option to supply multiple patterns. Patterns apply to outgoing payload syncs and `--reconcile-remote-changes`, not sync-state metadata.
+- `--exclude GLOB` excludes files matching an [rclone filter glob](https://rclone.org/filtering/). Repeat the option to supply multiple patterns. Patterns apply to outgoing payload syncs and startup reconciliation, not sync-state metadata.
 - `--no-consistent-writes` disables conditional state writes for direct S3-compatible destinations. S3 conditional writes are enabled by default and require rclone v1.73.0 or newer.
-- `--reconcile-remote-changes` enables generation-based remote-to-local startup reconciliation. It requires `--use-lock`.
 - `--force-delete-untracked-remote` permits initialization when the destination has no `.rcw-state` file but is not empty. Existing remote payload is deleted before the initial local-to-remote sync. It requires `--use-lock`.
 - `--fail-on-incomplete-sync` exits with status `1`, before lock acquisition or any remote write, if local or remote state records `"syncing": true`. It requires `--use-lock`.
 - `--state-file PATH` changes the state-file path on both sides. The path includes the filename and is resolved relative to each payload root.
@@ -82,11 +83,11 @@ Direct S3 remotes use conditional `If-None-Match` and `If-Match` writes by defau
 - `syncing` is set to `true` locally and remotely, together with an incremented generation, before each outgoing payload batch. It returns to `false` only after every payload operation succeeds.
 - `lock`, while held, contains an opaque owner token (or the supplied persistent ID) and an RFC3339Nano timestamp. Unlocking removes this field while preserving the rest of the state.
 
-With `--use-lock`, startup initializes untracked destinations and optionally reconciles generations as follows:
+With `--use-lock`, startup initializes untracked destinations and reconciles generations as follows:
 
 - If remote state is absent, an empty destination is locked at generation `0`, cleared, fully synced from local to remote, and promoted to generation `1`. A non-empty destination is rejected unless `--force-delete-untracked-remote` is supplied.
 - A remote generation `0` records an interrupted initialization. After acquiring its lock, startup clears the remote payload, retries the full local-to-remote sync, and promotes both state files to generation `1`.
-- With `--reconcile-remote-changes`, if only the remote file exists or its generation is higher, the remote is fully synced to the local source.
+- If only the remote state file exists or its generation is higher, the remote is fully synced to the local source.
 - Equal initialized generations skip reconciliation.
 - A completed local generation higher than an initialized remote is an error. A one-generation local advance marked incomplete is an unpublished metadata update and is rolled back safely.
 - Without `--fail-on-incomplete-sync`, an old `syncing` value is retained until a successful payload sync supersedes or completes it. With the option, startup refuses incomplete local or remote state before modifying the remote.

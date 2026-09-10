@@ -24,7 +24,8 @@ Options:
 
   --use-lock TIMEOUT
         Coordinate writers through the remote .rcw-state JSON file. The lock
-        timestamp is refreshed every TIMEOUT/2. TIMEOUT must be positive.
+        timestamp is refreshed every TIMEOUT/2. Remote generations are always
+        reconciled at startup. TIMEOUT must be positive.
 
   --lock-wait 0|DURATION|inf
         How long to wait when an active lock exists. By default, wait for the
@@ -40,20 +41,13 @@ Options:
 
   --exclude GLOB
         Exclude files matching an rclone filter glob. Repeat this option for
-        multiple patterns. Applies to outgoing syncs and
-        --reconcile-remote-changes.
+        multiple patterns. Applies to outgoing syncs and startup reconciliation.
 
   --no-consistent-writes
         Disable conditional state writes on direct S3-compatible destinations.
         By default S3 writes use If-None-Match/If-Match and require rclone
         v1.73.0 or newer. Use this only for providers without conditional
         write support.
-
-  --reconcile-remote-changes
-        Reconcile remote changes into SOURCE_FOLDER at startup using
-        .rcw-state generations. Requires --use-lock. A full remote-to-local
-        sync runs only when the remote generation is newer or local state is
-        absent.
 
   --force-delete-untracked-remote
         Initialize a non-empty destination that has no .rcw-state file by
@@ -94,13 +88,13 @@ State file behavior:
   delete the file. A destination without remote state must be empty unless
   --force-delete-untracked-remote is supplied. Initialization locks remote
   generation 0, clears its payload, fully syncs local to remote, then promotes
-  both state files to generation 1. If local state is absent or older,
-  --reconcile-remote-changes performs a full remote-to-local sync. Equal
-  generations skip it. A completed local generation ahead of remote is an
-  error. Before each outgoing batch, generation is incremented and syncing is
-  set true on both sides before payload changes. It is cleared only after the
-  entire batch succeeds, so failures remain detectable on the next run. A
-  required remote-to-local sync deletes local payload absent remotely.
+  both state files to generation 1. If local state is absent or older, startup
+  performs a full remote-to-local sync. Equal generations skip it. A completed
+  local generation ahead of remote is an error. Before each outgoing batch,
+  generation is incremented and syncing is set true on both sides before
+  payload changes. It is cleared only after the entire batch succeeds, so
+  failures remain detectable on the next run. A required remote-to-local sync
+  deletes local payload absent remotely.
 
   State paths inside either payload root are excluded from payload transfers.
   When local and remote paths differ, both relative names are reserved.
@@ -122,7 +116,7 @@ Examples:
 
   # Coordinate writers and pull newer remote state before watching.
   rclonewatch --interval 30s --use-lock 2m --lock-wait inf \
-    --reconcile-remote-changes --logs /srv/data s3:bucket/data
+    --logs /srv/data s3:bucket/data
 
   # Use an S3-compatible provider without conditional-write support.
   rclonewatch --use-lock 2m --no-consistent-writes \

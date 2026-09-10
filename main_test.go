@@ -284,7 +284,7 @@ func TestFinalSyncOnSIGTERM(t *testing.T) {
 	}
 	source := t.TempDir()
 	destination := t.TempDir()
-	process := startTestProcess(t, "--use-lock", "2s", "--reconcile-remote-changes", "--logs", source, destination)
+	process := startTestProcess(t, "--use-lock", "2s", "--logs", source, destination)
 	assertSyncState(t, filepath.Join(destination, defaultStateFile), 1, false, true)
 
 	if err := os.WriteFile(filepath.Join(source, "final.txt"), []byte("final contents"), 0o600); err != nil {
@@ -310,7 +310,7 @@ func TestIntervalSync(t *testing.T) {
 	}
 	source := t.TempDir()
 	destination := t.TempDir()
-	process := startTestProcess(t, "--interval", "50ms", "--use-lock", "2s", "--reconcile-remote-changes", "--logs", source, destination)
+	process := startTestProcess(t, "--interval", "50ms", "--use-lock", "2s", "--logs", source, destination)
 	if err := os.WriteFile(filepath.Join(source, "interval.txt"), []byte("interval contents"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -339,6 +339,34 @@ func TestIntervalSync(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	if err := process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := process.waitForExit(t); err != nil {
+		t.Fatalf("process exit: %v: %s", err, process.stderr.String())
+	}
+}
+
+func TestReconcilesRemoteChangesAtStartup(t *testing.T) {
+	if _, err := exec.LookPath("rclone"); err != nil {
+		t.Skip("rclone is not installed")
+	}
+	source := t.TempDir()
+	destination := t.TempDir()
+	writeTestFile(t, filepath.Join(source, "stale.txt"), "stale contents")
+	writeTestFile(t, filepath.Join(destination, "remote.txt"), "remote contents")
+	writeSyncState(t, filepath.Join(source, defaultStateFile), syncFileData{Generation: 1})
+	writeSyncState(t, filepath.Join(destination, defaultStateFile), syncFileData{Generation: 2})
+
+	process := startTestProcess(t, "--use-lock", "2s", "--logs", source, destination)
+	if got := readTestFile(t, filepath.Join(source, "remote.txt")); got != "remote contents" {
+		t.Fatalf("reconciled contents = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(source, "stale.txt")); !os.IsNotExist(err) {
+		t.Fatalf("local-only file was not deleted: %v", err)
+	}
+	assertSyncState(t, filepath.Join(source, defaultStateFile), 2, false, false)
+
 	if err := process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -407,20 +435,17 @@ func TestParseConfigRejectsNonPositiveLockTimeout(t *testing.T) {
 	}
 }
 
-func TestParseConfigRequiresLockForRemoteSync(t *testing.T) {
-	if _, err := parseConfig([]string{"--reconcile-remote-changes", t.TempDir(), "remote:destination"}); err == nil {
-		t.Fatal("--reconcile-remote-changes without --use-lock was accepted")
-	}
+func TestParseConfigRequiresLockForForceDeleteRemote(t *testing.T) {
 	if _, err := parseConfig([]string{"--force-delete-untracked-remote", t.TempDir(), "remote:destination"}); err == nil {
 		t.Fatal("--force-delete-untracked-remote without --use-lock was accepted")
 	}
 }
 
-func TestParseConfigRejectsRenamedOptions(t *testing.T) {
+func TestParseConfigRejectsRemovedOptions(t *testing.T) {
 	source := t.TempDir()
-	for _, option := range []string{"--sync-remote", "--sync-file", "--sync-file-local", "--sync-file-remote"} {
+	for _, option := range []string{"--reconcile-remote-changes", "--sync-remote", "--sync-file", "--sync-file-local", "--sync-file-remote"} {
 		args := []string{option}
-		if option != "--sync-remote" {
+		if option != "--reconcile-remote-changes" && option != "--sync-remote" {
 			args = append(args, "state.json")
 		}
 		args = append(args, source, "remote:destination")
@@ -590,7 +615,7 @@ func TestParseConfigStateFileOptions(t *testing.T) {
 		{"--use-lock", "1m", "--state-file", "one", "--state-file-local", "two", "--state-file-remote", "three", source, "remote:destination"},
 		{"--use-lock", "1m", "--state-file-local", "two", source, "remote:destination"},
 		{"--use-lock", "1m", "--state-file-remote", "three", source, "remote:destination"},
-		{"--use-lock", "1m", "--reconcile-remote-changes", "--fail-on-incomplete-sync", "--state-file", "/absolute", source, "remote:destination"},
+		{"--use-lock", "1m", "--fail-on-incomplete-sync", "--state-file", "/absolute", source, "remote:destination"},
 	}
 	for _, args := range tests {
 		if _, err := parseConfig(args); err == nil {
@@ -598,7 +623,7 @@ func TestParseConfigStateFileOptions(t *testing.T) {
 		}
 	}
 
-	cfg, err := parseConfig([]string{"--use-lock", "1m", "--reconcile-remote-changes", "--fail-on-incomplete-sync", "--state-file-local", "../local-state", "--state-file-remote", "../remote-state", source, "remote:destination/root"})
+	cfg, err := parseConfig([]string{"--use-lock", "1m", "--fail-on-incomplete-sync", "--state-file-local", "../local-state", "--state-file-remote", "../remote-state", source, "remote:destination/root"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -607,9 +632,6 @@ func TestParseConfigStateFileOptions(t *testing.T) {
 	}
 	if cfg.syncPaths.remote != "remote:destination/remote-state" || cfg.syncPaths.remoteFilter != "" {
 		t.Fatalf("remote sync path = %#v", cfg.syncPaths)
-	}
-	if _, err := parseConfig([]string{"--use-lock", "1m", "--fail-on-incomplete-sync", source, "remote:destination"}); err != nil {
-		t.Fatalf("--fail-on-incomplete-sync unexpectedly required --reconcile-remote-changes: %v", err)
 	}
 }
 
