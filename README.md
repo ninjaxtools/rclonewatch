@@ -95,6 +95,8 @@ By default, startup initializes untracked destinations and reconciles generation
 - A completed local generation higher than an initialized remote is an error. A one-generation local advance marked incomplete is an unpublished metadata update and is rolled back safely.
 - Without `--fail-on-incomplete-sync`, an old `syncing` value is retained until a successful payload sync supersedes or completes it. With the option, startup refuses incomplete local or remote state before modifying the remote.
 
+**Warning:** Files are not necessarily synced to the remote in the order they were written locally. If a program writes multiple files and a later write assumes that an earlier one has already been persisted, an interrupted sync may leave the remote in an inconsistent state.
+
 The executable requires Linux and an `rclone` executable on `PATH`. Rclone configuration is inherited from the process environment and rclone's standard config locations. Changed-path batches use `--files-from0`, so filenames containing newlines are handled safely.
 
 ## Releasing
