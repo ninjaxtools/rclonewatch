@@ -1,0 +1,41 @@
+#!/bin/sh
+
+set -eu
+
+remote="${1:-origin}"
+
+if [ -n "$(git status --porcelain)" ]; then
+	printf '%s\n' "publish-minor: the worktree must be clean" >&2
+	exit 1
+fi
+
+git fetch --tags "$remote"
+
+latest="$(git tag --sort=-version:refname | grep -Em1 '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+if [ -n "$latest" ]; then
+	remote_tag="$(git ls-remote --tags "$remote" "refs/tags/$latest")" || {
+		printf '%s\n' "publish-minor: could not inspect tags on $remote" >&2
+		exit 1
+	}
+	if [ -z "$remote_tag" ]; then
+		if [ "$(git rev-list -n 1 "$latest")" != "$(git rev-parse HEAD)" ]; then
+			printf '%s\n' "publish-minor: unpublished tag $latest does not point to HEAD" >&2
+			exit 1
+		fi
+		printf 'Pushing existing tag %s to %s\n' "$latest" "$remote"
+		git push "$remote" "refs/tags/$latest"
+		exit 0
+	fi
+else
+	latest="v0.0.0"
+fi
+
+version="${latest#v}"
+major="${version%%.*}"
+remainder="${version#*.}"
+minor="${remainder%%.*}"
+next="v${major}.$((minor + 1)).0"
+
+printf 'Creating and pushing %s to %s\n' "$next" "$remote"
+git tag -a "$next" -m "${next#v}"
+git push "$remote" "refs/tags/$next"

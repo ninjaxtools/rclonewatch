@@ -7,6 +7,8 @@ go build -o rclonewatch .
 ./rclonewatch --interval 5m --use-lock 2m --sync-remote --logs /srv/data remote:backup/data
 ```
 
+Prebuilt Linux binaries for amd64 and arm64 are attached to each [GitHub release](https://github.com/ninjaxtools/rclonewatch/releases).
+
 Arguments:
 
 - `SOURCE_FOLDER` is an existing local directory.
@@ -44,3 +46,13 @@ With `--sync-remote`, startup reconciles generations as follows:
 The startup remote-to-local operation is a full `rclone sync`: local files that are not present remotely are deleted when reconciliation is required. Sync-state paths inside a payload root are reserved and excluded from payload transfers. When local and remote state paths differ, both relative names are excluded. A path resolved outside its root needs no exclusion. `..` components are supported after resolution; absolute state paths are rejected.
 
 The executable requires Linux and an `rclone` executable on `PATH`. Rclone configuration is inherited from the process environment and rclone's standard config locations. Changed-path batches use `--files-from0`, so filenames containing newlines are handled safely.
+
+## Releasing
+
+Run the minor-version release script from a clean worktree:
+
+```sh
+./publish-minor
+```
+
+The script increments the latest stable version tag from `vMAJOR.MINOR.PATCH` to `vMAJOR.(MINOR+1).0` and pushes it to `origin`. Pushing the tag runs the tests and publishes both Linux binaries with SHA-256 checksums.
