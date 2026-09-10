@@ -90,7 +90,16 @@ With `--use-lock`, startup initializes untracked destinations and optionally rec
 - A completed local generation higher than an initialized remote is an error. A one-generation local advance marked incomplete is an unpublished metadata update and is rolled back safely.
 - Without `--fail-on-incomplete-sync`, an old `syncing` value is retained until a successful payload sync supersedes or completes it. With the option, startup refuses incomplete local or remote state before modifying the remote.
 
-Startup initialization and remote-to-local reconciliation use full `rclone sync` operations. Initialization first deletes all existing remote payload and then syncs local to remote; reconciliation deletes local files that are absent remotely. User-supplied `--exclude` patterns apply in both sync directions. When exclusions are configured, outgoing changed-path batches use a full filtered sync so creates and deletions consistently obey rclone's glob semantics. Sync-state paths inside a payload root are reserved and excluded from payload transfers. When local and remote state paths differ, both relative names are excluded. A path resolved outside its root needs no exclusion. `..` components are supported after resolution; absolute state paths are rejected.
+| When | What happens |
+| --- | --- |
+| A remote is initialized at startup | The remote payload is cleared, then a full local-to-remote `rclone sync` runs. |
+| Remote changes are reconciled at startup | A full remote-to-local `rclone sync` creates or updates local files and deletes local-only files. |
+| A normal changed-path batch has no exclusions | Only the observed creates, updates, and deletions are sent to the remote. |
+| A changed-path batch has `--exclude` patterns or requires whole-tree reconciliation | A full local-to-remote sync runs; exclusions are applied as rclone glob filters. |
+
+- User-supplied `--exclude` patterns apply in both directions.
+- State paths inside a payload root are reserved and excluded from payload transfers. If the local and remote names differ, both are excluded.
+- State paths may contain `..` and resolve outside the payload root, but they cannot be absolute. Paths outside the root need no payload exclusion.
 
 The executable requires Linux and an `rclone` executable on `PATH`. Rclone configuration is inherited from the process environment and rclone's standard config locations. Changed-path batches use `--files-from0`, so filenames containing newlines are handled safely.
 
