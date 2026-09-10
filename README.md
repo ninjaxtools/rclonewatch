@@ -55,4 +55,4 @@ Run the minor-version release script from a clean worktree:
 ./publish-minor
 ```
 
-The script increments the latest stable version tag from `vMAJOR.MINOR.PATCH` to `vMAJOR.(MINOR+1).0` and pushes it to `origin`. Pushing the tag runs the tests and publishes both Linux binaries with SHA-256 checksums.
+The script pushes the current branch, increments the latest stable version tag from `vMAJOR.MINOR.PATCH` to `vMAJOR.(MINOR+1).0`, and pushes the tag to `origin`. Pushing the tag runs the tests and publishes both Linux binaries with SHA-256 checksums.
