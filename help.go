@@ -6,7 +6,7 @@ import (
 )
 
 func printUsage(output io.Writer) {
-	fmt.Fprintln(output, "Usage: rclonewatch [OPTIONS] SOURCE_FOLDER RCLONE_DESTINATION")
+	fmt.Fprintln(output, "Usage: rclonewatch [OPTIONS] SOURCE_FOLDER RCLONE_DESTINATION [-- COMMAND [ARG...]]")
 }
 
 func printHelp(output io.Writer) {
@@ -14,7 +14,7 @@ func printHelp(output io.Writer) {
 syncs deduplicated changed paths to an rclone destination.
 
 Usage:
-  rclonewatch [OPTIONS] SOURCE_FOLDER RCLONE_DESTINATION
+  rclonewatch [OPTIONS] SOURCE_FOLDER RCLONE_DESTINATION [-- COMMAND [ARG...]]
 
 Options:
   --interval DURATION
@@ -31,6 +31,16 @@ Options:
         observed lock to expire but fail if it is refreshed. An explicit 0
         exits immediately. A duration waits up to that total time while
         following refreshes. inf waits indefinitely. Units are s, m, h.
+
+  --persistent-lock ID
+        Hold the lock under ID and retain it when rclonewatch exits. A later
+        invocation using the same ID continues that lock without waiting for
+        expiry, refreshing it first only when its normal refresh is due.
+        Requires --use-lock.
+
+  --exclude GLOB
+        Exclude files matching an rclone filter glob. Repeat this option for
+        multiple patterns. Applies to outgoing syncs and --sync-remote.
 
   --no-consistent-writes
         Disable conditional state writes on direct S3-compatible destinations.
@@ -64,6 +74,12 @@ Options:
   -h, --help
         Show this help and exit.
 
+Wrapped command:
+  Arguments after -- are run as a command once inotify is ready. rclonewatch
+  watches until the command exits, then drains events, performs a final sync,
+  and returns the command's status if syncing succeeds. SIGINT and SIGTERM are
+  forwarded to the command, whose exit is awaited before final shutdown.
+
 Sync file behavior:
   .rcw-sync combines the persistent generation, incomplete-sync flag, and
   optional lock owner/timestamp. Unlocking clears the lock fields but does not
@@ -81,10 +97,15 @@ Sync file behavior:
 Shutdown and retries:
   Failed running syncs retry with exponential backoff from 1 second to 1
   minute. SIGINT or SIGTERM drains queued inotify events, performs a final
-  sync, clears an owned lock, and exits. Status 0 means no changed paths are
-  left unsynced; runtime failures use status 1 and usage errors status 2.
+  sync, clears an owned non-persistent lock, and exits. Runtime failures use
+  status 1 and usage errors status 2.
 
 Examples:
+  # Wrap a command, periodically sync, and retain a reusable lock.
+  rclonewatch --interval 30s --use-lock 2m \
+    --persistent-lock build-sequence --exclude '*.tmp' --logs \
+    /srv/data remote:backup/data -- ./build.sh --release
+
   # Periodically sync local changes.
   rclonewatch --interval 5m /srv/data remote:backup/data
 

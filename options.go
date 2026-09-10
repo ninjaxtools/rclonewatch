@@ -7,6 +7,23 @@ import (
 	"time"
 )
 
+type excludePatterns []string
+
+func (patterns *excludePatterns) Set(value string) error {
+	if value == "" {
+		return errors.New("exclude pattern must not be empty")
+	}
+	*patterns = append(*patterns, value)
+	return nil
+}
+
+func (patterns *excludePatterns) String() string {
+	if patterns == nil {
+		return ""
+	}
+	return strings.Join(*patterns, ",")
+}
+
 type lockWait struct {
 	duration time.Duration
 	infinite bool

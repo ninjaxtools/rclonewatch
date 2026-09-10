@@ -39,10 +39,25 @@ func TestLockWaitParsing(t *testing.T) {
 	}
 }
 
+func TestExcludePatterns(t *testing.T) {
+	var patterns excludePatterns
+	for _, pattern := range []string{"*.tmp", "/cache/**"} {
+		if err := patterns.Set(pattern); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := patterns.String(); got != "*.tmp,/cache/**" {
+		t.Fatalf("String = %q", got)
+	}
+	if err := patterns.Set(""); err == nil {
+		t.Fatal("empty pattern was accepted")
+	}
+}
+
 func TestHelpIncludesOptionsAndExamples(t *testing.T) {
 	var output bytes.Buffer
 	printHelp(&output)
-	for _, text := range []string{"--interval", "--use-lock", "--lock-wait", "--no-consistent-writes", "--sync-remote", "--fail-on-incomplete-sync", "--sync-file", "--sync-file-local", "--sync-file-remote", "--logs", "Sync file behavior:", "Examples:"} {
+	for _, text := range []string{"--interval", "--use-lock", "--lock-wait", "--persistent-lock", "--exclude", "--no-consistent-writes", "--sync-remote", "--fail-on-incomplete-sync", "--sync-file", "--sync-file-local", "--sync-file-remote", "--logs", "Wrapped command:", "Sync file behavior:", "Examples:"} {
 		if !strings.Contains(output.String(), text) {
 			t.Errorf("help does not contain %q", text)
 		}

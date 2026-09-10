@@ -161,6 +161,36 @@ func TestSyncerWithLocalRclone(t *testing.T) {
 	}
 }
 
+func TestSyncerWithLocalRcloneExcludes(t *testing.T) {
+	if _, err := exec.LookPath("rclone"); err != nil {
+		t.Skip("rclone is not installed")
+	}
+	source := t.TempDir()
+	destination := t.TempDir()
+	writeTestFile(t, filepath.Join(source, "included.txt"), "included")
+	writeTestFile(t, filepath.Join(source, "source.tmp"), "excluded")
+	writeTestFile(t, filepath.Join(destination, "remote.tmp"), "retained")
+	s := syncer{
+		source:   source,
+		dest:     destination,
+		excludes: []string{"*.tmp"},
+		logger:   log.New(io.Discard, "", 0),
+		runner:   rcloneCommand{},
+	}
+	if err := s.Sync(map[string]change{"included.txt": {path: "included.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readTestFile(t, filepath.Join(destination, "included.txt")); got != "included" {
+		t.Fatalf("included contents = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "source.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("excluded source file was synced: %v", err)
+	}
+	if got := readTestFile(t, filepath.Join(destination, "remote.tmp")); got != "retained" {
+		t.Fatalf("excluded remote contents = %q, want retained", got)
+	}
+}
+
 func TestRemotePath(t *testing.T) {
 	tests := map[string]string{
 		"remote:":       "remote:path/to/file",
@@ -219,6 +249,32 @@ func TestSyncFileAncestorForcesFilteredFullSync(t *testing.T) {
 	}
 	if got := runner.commands[0].args[0]; got != "sync" {
 		t.Fatalf("command = %q, want filtered full sync", got)
+	}
+}
+
+func TestSyncerAppliesExcludes(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "changed.txt"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingRunner{}
+	s := syncer{
+		source:   source,
+		dest:     "remote:backup",
+		excludes: []string{"*.tmp", "/cache/**"},
+		logger:   log.New(io.Discard, "", 0),
+		runner:   runner,
+	}
+	if err := s.Sync(map[string]change{"changed.txt": {path: "changed.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("commands = %#v, want one filtered full sync", runner.commands)
+	}
+	args := runner.commands[0].args
+	want := []string{"--exclude", "*.tmp", "--exclude", "/cache/**"}
+	if !reflect.DeepEqual(args[len(args)-len(want):], want) {
+		t.Fatalf("sync args = %#v, want suffix %#v", args, want)
 	}
 }
 
@@ -361,6 +417,7 @@ func TestParseConfigRequiresLockForLockOptions(t *testing.T) {
 	source := t.TempDir()
 	for _, args := range [][]string{
 		{"--lock-wait", "1m", source, "remote:destination"},
+		{"--persistent-lock", "sequence", source, "remote:destination"},
 		{"--no-consistent-writes", source, "remote:destination"},
 		{"--fail-on-incomplete-sync", source, "remote:destination"},
 		{"--sync-file", "state.json", source, "remote:destination"},
@@ -375,6 +432,96 @@ func TestParseConfigRequiresLockForLockOptions(t *testing.T) {
 	}
 	if !cfg.lockWait.infinite {
 		t.Fatal("--lock-wait inf was not retained")
+	}
+	if _, err := parseConfig([]string{"--use-lock", "2m", "--persistent-lock", "", source, "remote:destination"}); err == nil {
+		t.Fatal("empty --persistent-lock was accepted")
+	}
+}
+
+func TestParseConfigWrappedCommand(t *testing.T) {
+	source := t.TempDir()
+	cfg, err := parseConfig([]string{"--use-lock", "2m", "--persistent-lock", "sequence", source, "remote:destination", "--", "sh", "-c", "exit 7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.persistentLock != "sequence" {
+		t.Fatalf("persistent lock = %q, want sequence", cfg.persistentLock)
+	}
+	want := []string{"sh", "-c", "exit 7"}
+	if !reflect.DeepEqual(cfg.command, want) {
+		t.Fatalf("wrapped command = %#v, want %#v", cfg.command, want)
+	}
+	if _, err := parseConfig([]string{source, "remote:destination", "--"}); err == nil {
+		t.Fatal("empty wrapped command was accepted")
+	}
+}
+
+func TestParseConfigExcludes(t *testing.T) {
+	source := t.TempDir()
+	cfg, err := parseConfig([]string{"--exclude", "*.tmp", "--exclude", "/cache/**", source, "remote:destination"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := excludePatterns{"*.tmp", "/cache/**"}
+	if !reflect.DeepEqual(cfg.excludes, want) {
+		t.Fatalf("excludes = %#v, want %#v", cfg.excludes, want)
+	}
+	if _, err := parseConfig([]string{"--exclude", "", source, "remote:destination"}); err == nil {
+		t.Fatal("empty --exclude was accepted")
+	}
+}
+
+func TestWrappedCommandExitStatus(t *testing.T) {
+	source := t.TempDir()
+	destination := t.TempDir()
+	if got := run(config{source: source, dest: destination, command: []string{"sh", "-c", "exit 7"}}); got != 7 {
+		t.Fatalf("run exit status = %d, want 7", got)
+	}
+}
+
+func TestWrappedCommandFinalSync(t *testing.T) {
+	if _, err := exec.LookPath("rclone"); err != nil {
+		t.Skip("rclone is not installed")
+	}
+	source := t.TempDir()
+	destination := t.TempDir()
+	created := filepath.Join(source, "created.txt")
+	command := []string{"sh", "-c", fmt.Sprintf("printf contents > %s", created)}
+	if got := run(config{source: source, dest: destination, command: command}); got != 0 {
+		t.Fatalf("run exit status = %d, want 0", got)
+	}
+	if got := readTestFile(t, filepath.Join(destination, "created.txt")); got != "contents" {
+		t.Fatalf("synced command output = %q, want contents", got)
+	}
+}
+
+func TestWrappedCommandReceivesSIGTERM(t *testing.T) {
+	source := t.TempDir()
+	destination := t.TempDir()
+	markers := t.TempDir()
+	ready := filepath.Join(markers, "ready")
+	terminated := filepath.Join(markers, "terminated")
+	script := fmt.Sprintf("trap 'touch %s; exit 0' TERM; touch %s; while :; do sleep 1; done", terminated, ready)
+	process := startTestProcess(t, "--logs", source, destination, "--", "sh", "-c", script)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			process.cmd.Process.Kill()
+			t.Fatal("wrapped command did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := process.waitForExit(t); err != nil {
+		t.Fatalf("process exit: %v: %s", err, process.stderr.String())
+	}
+	if _, err := os.Stat(terminated); err != nil {
+		t.Fatalf("wrapped command did not handle SIGTERM: %v", err)
 	}
 }
 

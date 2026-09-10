@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -110,7 +111,7 @@ func (r *memorySyncRunner) writes() int {
 	return r.copyCount
 }
 
-func newMemoryState(t *testing.T, runner *memorySyncRunner, timeout time.Duration, wait lockWait, consistent, failOnIncomplete bool) (*syncState, string) {
+func newMemoryState(t *testing.T, runner *memorySyncRunner, timeout time.Duration, wait lockWait, consistent, failOnIncomplete bool, persistentID ...string) (*syncState, string) {
 	t.Helper()
 	source := t.TempDir()
 	paths := syncFilePaths{
@@ -119,7 +120,11 @@ func newMemoryState(t *testing.T, runner *memorySyncRunner, timeout time.Duratio
 		localFilter:  defaultSyncFile,
 		remoteFilter: defaultSyncFile,
 	}
-	state, err := newSyncState(paths, source, "remote:destination", timeout, wait, consistent, failOnIncomplete, false, log.New(io.Discard, "", 0), runner)
+	id := ""
+	if len(persistentID) > 0 {
+		id = persistentID[0]
+	}
+	state, err := newSyncState(paths, source, "remote:destination", timeout, wait, consistent, failOnIncomplete, false, log.New(io.Discard, "", 0), runner, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +139,7 @@ func TestSyncStateLifecycleWithLocalRclone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := newSyncState(paths, source, destination, 500*time.Millisecond, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{})
+	state, err := newSyncState(paths, source, destination, 500*time.Millisecond, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,6 +262,68 @@ func TestSyncStateWaitModes(t *testing.T) {
 		}()
 		if err := state.Acquire(make(chan os.Signal)); err != nil {
 			t.Fatal(err)
+		}
+		state.Start()
+		if err := state.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestPersistentLock(t *testing.T) {
+	t.Run("continues fresh lock without writing", func(t *testing.T) {
+		runner := &memorySyncRunner{}
+		timestamp := time.Now().UTC()
+		runner.setData(syncFileData{Generation: 3, Lock: &syncFileLock{Owner: "sequence", Timestamp: timestamp}})
+		state, _ := newMemoryState(t, runner, time.Hour, lockWait{explicit: true}, false, false, "sequence")
+		if err := state.Acquire(make(chan os.Signal)); err != nil {
+			t.Fatal(err)
+		}
+		if got := runner.writes(); got != 0 {
+			t.Fatalf("remote writes during continuation = %d, want 0", got)
+		}
+		state.Start()
+		if err := state.Close(); err != nil {
+			t.Fatal(err)
+		}
+		remote := runner.data(t)
+		if remote.Lock == nil || remote.Lock.Owner != "sequence" || !remote.Lock.Timestamp.Equal(timestamp) {
+			t.Fatalf("retained lock = %#v, want original sequence lock", remote.Lock)
+		}
+	})
+
+	t.Run("refreshes due lock", func(t *testing.T) {
+		runner := &memorySyncRunner{}
+		timestamp := time.Now().Add(-time.Hour).UTC()
+		runner.setData(syncFileData{Generation: 2, Lock: &syncFileLock{Owner: "sequence", Timestamp: timestamp}})
+		state, _ := newMemoryState(t, runner, time.Hour, lockWait{explicit: true}, false, false, "sequence")
+		if err := state.Acquire(make(chan os.Signal)); err != nil {
+			t.Fatal(err)
+		}
+		if got := runner.writes(); got != 1 {
+			t.Fatalf("remote writes during refresh = %d, want 1", got)
+		}
+		remote := runner.data(t)
+		if remote.Lock == nil || remote.Lock.Owner != "sequence" || !remote.Lock.Timestamp.After(timestamp) {
+			t.Fatalf("refreshed lock = %#v", remote.Lock)
+		}
+		state.Start()
+		if err := state.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if runner.data(t).Lock == nil {
+			t.Fatal("persistent lock was removed on close")
+		}
+	})
+
+	t.Run("writes ID into new lock", func(t *testing.T) {
+		runner := &memorySyncRunner{}
+		state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false, "sequence")
+		if err := state.Acquire(make(chan os.Signal)); err != nil {
+			t.Fatal(err)
+		}
+		if lock := runner.data(t).Lock; lock == nil || lock.Owner != "sequence" {
+			t.Fatalf("new lock = %#v, want owner sequence", lock)
 		}
 		state.Start()
 		if err := state.Close(); err != nil {
@@ -423,6 +490,31 @@ func TestSyncStateRetainsIncompleteFlagAfterPayloadFailure(t *testing.T) {
 	}
 }
 
+func TestSyncFromRemoteAppliesExcludes(t *testing.T) {
+	runner := &recordingRunner{}
+	state := &syncState{
+		paths: syncFilePaths{
+			localFilter:  ".local-state",
+			remoteFilter: ".remote-state",
+		},
+		source:   "/source",
+		dest:     "remote:destination",
+		excludes: []string{"*.tmp", "/cache/**"},
+		runner:   runner,
+	}
+	if err := state.syncFromRemote(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"sync", "remote:destination", "/source", "--create-empty-src-dirs",
+		"--exclude", "/.local-state", "--exclude", "/.remote-state",
+		"--exclude", "*.tmp", "--exclude", "/cache/**",
+	}
+	if !reflect.DeepEqual(runner.commands[0].args, want) {
+		t.Fatalf("remote sync args = %#v, want %#v", runner.commands[0].args, want)
+	}
+}
+
 func TestSyncStateInitializeGeneration(t *testing.T) {
 	requireRclone(t)
 	t.Run("absent", func(t *testing.T) {
@@ -516,7 +608,7 @@ func TestSyncStateRejectsInvalidGenerationOrdering(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			state, err := newSyncState(paths, source, destination, time.Hour, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{})
+			state, err := newSyncState(paths, source, destination, time.Hour, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{}, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -562,7 +654,7 @@ func acquireLocalState(t *testing.T, source, destination string) *syncState {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := newSyncState(paths, source, destination, time.Hour, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{})
+	state, err := newSyncState(paths, source, destination, time.Hour, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}

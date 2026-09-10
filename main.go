@@ -26,6 +26,8 @@ type config struct {
 	interval           time.Duration
 	lockTimeout        time.Duration
 	lockWait           lockWait
+	persistentLock     string
+	excludes           excludePatterns
 	logs               bool
 	syncRemote         bool
 	failOnIncomplete   bool
@@ -36,6 +38,7 @@ type config struct {
 	syncPaths          syncFilePaths
 	source             string
 	dest               string
+	command            []string
 }
 
 type commandRunner interface {
@@ -73,6 +76,7 @@ type syncer struct {
 	trackState bool
 	logger     *log.Logger
 	runner     commandRunner
+	excludes   []string
 }
 
 func (s *syncer) Sync(batch map[string]change) error {
@@ -116,12 +120,15 @@ func (s *syncer) Sync(batch map[string]change) error {
 	}
 
 	_, requestedFull := batch["."]
-	if full || requestedFull {
+	if full || requestedFull || len(s.excludes) > 0 {
 		args := []string{"sync", s.source, s.dest, "--create-empty-src-dirs"}
 		if s.state != nil {
 			for _, filter := range s.state.payloadFilters() {
 				args = append(args, "--exclude", "/"+filter)
 			}
+		}
+		for _, pattern := range s.excludes {
+			args = append(args, "--exclude", pattern)
 		}
 		if err := s.run(args...); err != nil {
 			return fmt.Errorf("full sync: %w", err)
@@ -289,6 +296,23 @@ func mergeFailedBatch(pending, failed map[string]change) {
 	}
 }
 
+func commandExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) {
+		return 1
+	}
+	if code := exitError.ExitCode(); code >= 0 {
+		return code
+	}
+	if status, ok := exitError.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return 128 + int(status.Signal())
+	}
+	return 1
+}
+
 func run(cfg config) (exitCode int) {
 	logger := log.New(io.Discard, "rclonewatch: ", log.LstdFlags)
 	if cfg.logs {
@@ -308,11 +332,12 @@ func run(cfg config) (exitCode int) {
 			fmt.Fprintf(os.Stderr, "rclonewatch: configure lock writes: %v\n", err)
 			return 1
 		}
-		state, err = newSyncState(cfg.syncPaths, cfg.source, cfg.dest, cfg.lockTimeout, cfg.lockWait, consistentWrites, cfg.failOnIncomplete, cfg.logs, logger, runner)
+		state, err = newSyncState(cfg.syncPaths, cfg.source, cfg.dest, cfg.lockTimeout, cfg.lockWait, consistentWrites, cfg.failOnIncomplete, cfg.logs, logger, runner, cfg.persistentLock)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "rclonewatch: initialize sync state: %v\n", err)
 			return 1
 		}
+		state.excludes = append([]string(nil), cfg.excludes...)
 		if err := state.Acquire(signals); err != nil {
 			if errors.Is(err, errLockInterrupted) {
 				return 0
@@ -358,6 +383,24 @@ func run(cfg config) (exitCode int) {
 		trackState: state != nil,
 		logger:     logger,
 		runner:     runner,
+		excludes:   append([]string(nil), cfg.excludes...),
+	}
+
+	var wrapped *exec.Cmd
+	var commandDone <-chan error
+	if len(cfg.command) > 0 {
+		wrapped = exec.Command(cfg.command[0], cfg.command[1:]...)
+		wrapped.Stdin = os.Stdin
+		wrapped.Stdout = os.Stdout
+		wrapped.Stderr = os.Stderr
+		if err := wrapped.Start(); err != nil {
+			watcher.Close()
+			fmt.Fprintf(os.Stderr, "rclonewatch: start wrapped command: %v\n", err)
+			return 1
+		}
+		done := make(chan error, 1)
+		commandDone = done
+		go func() { done <- wrapped.Wait() }()
 	}
 
 	if cfg.logs {
@@ -376,6 +419,7 @@ func run(cfg config) (exitCode int) {
 
 	var active, stopping, watcherClosed, finalAttempted, syncReady bool
 	var watcherErr, lockErr, lastSyncErr error
+	wrappedExitCode := 0
 	retryDelay := initialRetryDelay
 	eventC := watcher.Events()
 	errorC := watcher.Errors()
@@ -396,7 +440,7 @@ func run(cfg config) (exitCode int) {
 	}
 
 	for {
-		if stopping && watcherClosed && !active {
+		if stopping && watcherClosed && !active && commandDone == nil {
 			if lockErr != nil {
 				fmt.Fprintf(os.Stderr, "rclonewatch: lock refresh failed: %v\n", lockErr)
 				return 1
@@ -412,7 +456,7 @@ func run(cfg config) (exitCode int) {
 					fmt.Fprintf(os.Stderr, "rclonewatch: final sync failed: %v\n", lastSyncErr)
 					return 1
 				}
-				return 0
+				return wrappedExitCode
 			}
 		}
 
@@ -443,6 +487,9 @@ func run(cfg config) (exitCode int) {
 				watcherErr = err
 				stopping = true
 				timerC = nil
+				if commandDone != nil {
+					_ = wrapped.Process.Signal(syscall.SIGTERM)
+				}
 				watcher.Close()
 			}
 		case err, ok := <-lockErrors:
@@ -455,6 +502,9 @@ func run(cfg config) (exitCode int) {
 				stopping = true
 				timerC = nil
 				syncReady = false
+				if commandDone != nil {
+					_ = wrapped.Process.Signal(syscall.SIGTERM)
+				}
 				watcher.Close()
 			}
 		case <-timerC:
@@ -490,7 +540,22 @@ func run(cfg config) (exitCode int) {
 					timerC = timer.C
 				}
 			}
-		case <-signals:
+		case err := <-commandDone:
+			commandDone = nil
+			wrappedExitCode = commandExitCode(err)
+			if cfg.logs {
+				logger.Printf("wrapped command exited with status %d", wrappedExitCode)
+			}
+			if !stopping {
+				stopping = true
+				timerC = nil
+				syncReady = false
+			}
+			watcher.Close()
+		case sig := <-signals:
+			if commandDone != nil {
+				_ = wrapped.Process.Signal(sig)
+			}
 			if !stopping {
 				stopping = true
 				timerC = nil
@@ -498,19 +563,34 @@ func run(cfg config) (exitCode int) {
 				if cfg.logs {
 					logger.Printf("shutdown requested; waiting for final sync")
 				}
-				watcher.Close()
+				if commandDone == nil {
+					watcher.Close()
+				}
 			}
 		}
 	}
 }
 
 func parseConfig(args []string) (config, error) {
+	var cfg config
+	for index, arg := range args {
+		if arg != "--" {
+			continue
+		}
+		if index+1 == len(args) {
+			return config{}, errors.New("expected a command after --")
+		}
+		cfg.command = append([]string(nil), args[index+1:]...)
+		args = args[:index]
+		break
+	}
 	flags := flag.NewFlagSet("rclonewatch", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	var cfg config
 	flags.DurationVar(&cfg.interval, "interval", 0, "time to wait after a successful sync (for example 30s or 5m)")
 	flags.DurationVar(&cfg.lockTimeout, "use-lock", 0, "coordinate using the remote sync file with this expiry timeout")
 	flags.Var(&cfg.lockWait, "lock-wait", "maximum time to wait for an active lock: 0, a duration using s/m/h, or inf")
+	flags.StringVar(&cfg.persistentLock, "persistent-lock", "", "continue and retain the lock under this ID")
+	flags.Var(&cfg.excludes, "exclude", "exclude files matching this rclone glob (repeatable)")
 	flags.BoolVar(&cfg.logs, "logs", false, "log sync activity and rclone output to stdout")
 	flags.BoolVar(&cfg.syncRemote, "sync-remote", false, "reconcile a newer remote generation into the local source at startup")
 	flags.BoolVar(&cfg.failOnIncomplete, "fail-on-incomplete-sync", false, "exit if the sync file records an incomplete sync")
@@ -526,6 +606,7 @@ func parseConfig(args []string) (config, error) {
 	}
 	lockSet := false
 	lockWaitSet := false
+	persistentLockSet := false
 	syncFileSet := false
 	syncFileLocalSet := false
 	syncFileRemoteSet := false
@@ -535,6 +616,9 @@ func parseConfig(args []string) (config, error) {
 		}
 		if item.Name == "lock-wait" {
 			lockWaitSet = true
+		}
+		if item.Name == "persistent-lock" {
+			persistentLockSet = true
 		}
 		switch item.Name {
 		case "sync-file":
@@ -553,6 +637,12 @@ func parseConfig(args []string) (config, error) {
 	}
 	if lockWaitSet && !lockSet {
 		return config{}, errors.New("--lock-wait requires --use-lock with a timeout")
+	}
+	if persistentLockSet && !lockSet {
+		return config{}, errors.New("--persistent-lock requires --use-lock with a timeout")
+	}
+	if persistentLockSet && cfg.persistentLock == "" {
+		return config{}, errors.New("--persistent-lock must not be empty")
 	}
 	if cfg.noConsistentWrites && !lockSet {
 		return config{}, errors.New("--no-consistent-writes requires --use-lock with a timeout")

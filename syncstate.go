@@ -50,6 +50,8 @@ type syncState struct {
 	logger           *log.Logger
 	runner           commandRunner
 	owner            string
+	persistent       bool
+	excludes         []string
 
 	mu         sync.Mutex
 	updateMu   sync.Mutex
@@ -62,10 +64,14 @@ type syncState struct {
 	releaseErr error
 }
 
-func newSyncState(paths syncFilePaths, source, destination string, timeout time.Duration, wait lockWait, consistentWrites, failOnIncomplete, logs bool, logger *log.Logger, runner commandRunner) (*syncState, error) {
-	ownerBytes := make([]byte, 16)
-	if _, err := rand.Read(ownerBytes); err != nil {
-		return nil, fmt.Errorf("create lock owner token: %w", err)
+func newSyncState(paths syncFilePaths, source, destination string, timeout time.Duration, wait lockWait, consistentWrites, failOnIncomplete, logs bool, logger *log.Logger, runner commandRunner, persistentID string) (*syncState, error) {
+	owner := persistentID
+	if owner == "" {
+		ownerBytes := make([]byte, 16)
+		if _, err := rand.Read(ownerBytes); err != nil {
+			return nil, fmt.Errorf("create lock owner token: %w", err)
+		}
+		owner = hex.EncodeToString(ownerBytes)
 	}
 	return &syncState{
 		paths:            paths,
@@ -79,7 +85,8 @@ func newSyncState(paths syncFilePaths, source, destination string, timeout time.
 		logs:             logs,
 		logger:           logger,
 		runner:           runner,
-		owner:            hex.EncodeToString(ownerBytes),
+		owner:            owner,
+		persistent:       persistentID != "",
 		stop:             make(chan struct{}),
 		done:             make(chan struct{}),
 		errors:           make(chan error, 1),
@@ -104,6 +111,23 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 	localIncompleteAdvance := localExists && remote.exists && local.Syncing && local.Generation == remote.data.Generation+1
 	if localExists && local.Generation > remote.data.Generation && !localIncompleteAdvance {
 		return fmt.Errorf("local generation %d is ahead of remote generation %d", local.Generation, remote.data.Generation)
+	}
+	if s.persistent && remote.ownedBy(s.owner) {
+		s.setRemote(remote)
+		refreshInterval := max(s.timeout/2, time.Nanosecond)
+		if !time.Now().Before(remote.data.Lock.Timestamp.Add(refreshInterval)) {
+			candidate := remote.data
+			candidate.Lock = &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC()}
+			if err := s.replaceOwnedRemote(remote, candidate); err != nil {
+				return fmt.Errorf("refresh persistent lock: %w", err)
+			}
+			if s.logs {
+				s.logger.Printf("persistent remote lock refreshed")
+			}
+		} else if s.logs {
+			s.logger.Printf("persistent remote lock continued")
+		}
+		return nil
 	}
 
 	var deadline time.Time
@@ -296,6 +320,12 @@ func (s *syncState) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.stop)
 		<-s.done
+		if s.persistent {
+			if s.logs {
+				s.logger.Printf("persistent remote lock retained")
+			}
+			return
+		}
 		s.updateMu.Lock()
 		defer s.updateMu.Unlock()
 		remote := s.getRemote()
@@ -372,6 +402,9 @@ func (s *syncState) syncFromRemote() error {
 	args := []string{"sync", s.dest, s.source, "--create-empty-src-dirs"}
 	for _, filter := range s.payloadFilters() {
 		args = append(args, "--exclude", "/"+filter)
+	}
+	for _, pattern := range s.excludes {
+		args = append(args, "--exclude", pattern)
 	}
 	return s.run(args...)
 }
