@@ -97,8 +97,6 @@ By default, startup initializes untracked destinations and reconciles generation
 
 **Warning:** Files are not necessarily synced to the remote in the order they were written locally. If a program writes multiple files and a later write assumes that an earlier one has already been persisted, an interrupted sync may leave the remote in an inconsistent state.
 
-The executable requires Linux and an `rclone` executable on `PATH`. Rclone configuration is inherited from the process environment and rclone's standard config locations. Changed-path batches use `--files-from0`, so filenames containing newlines are handled safely.
-
 ## Releasing
 
 Run the minor-version release script from a clean worktree:
