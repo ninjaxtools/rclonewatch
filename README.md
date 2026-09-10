@@ -27,8 +27,8 @@ Arguments:
 - `--fail-on-incomplete-sync` exits with status `1`, before lock acquisition or any remote write, if local or remote state records `"syncing": true`. It requires `--use-lock`.
 - `--sync-file PATH` changes the sync-state path on both sides. The path includes the filename and is resolved relative to each payload root.
 - `--sync-file-local PATH` and `--sync-file-remote PATH` set different paths and must be supplied together. They cannot be combined with `--sync-file`.
-- `--logs` writes sync status, changed paths, and rclone output to stdout.
-- `-- COMMAND [ARG...]` runs a command after inotify is ready. `rclonewatch` watches until it exits, then performs the final sync and returns the command's status when syncing succeeds. `SIGINT` and `SIGTERM` are forwarded to the command, and `rclonewatch` waits for it to exit.
+- `--logs` writes rclonewatch diagnostics, sync status, changed paths, and rclone output to stdout. Without it, rclonewatch does not write any runtime output itself.
+- `-- COMMAND [ARG...]` runs a command after inotify is ready with standard input, output, and error passed through unchanged. `rclonewatch` watches until it exits, then performs the final sync and returns the command's status when syncing succeeds. `SIGINT` and `SIGTERM` are forwarded to the command, and `rclonewatch` waits for it to exit.
 
 Send `SIGINT` or `SIGTERM` to stop watching, finish one final sync, and exit. With a wrapped command, its status is returned when syncing succeeds. A failed final sync, lock/generation failure, or watcher failure exits with status `1`; invalid command-line usage exits with status `2`.
 

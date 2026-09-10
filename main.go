@@ -329,12 +329,12 @@ func run(cfg config) (exitCode int) {
 	if cfg.lockTimeout > 0 {
 		consistentWrites, err := useConsistentWrites(cfg.dest, cfg.noConsistentWrites, runner)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "rclonewatch: configure lock writes: %v\n", err)
+			logger.Printf("configure lock writes: %v", err)
 			return 1
 		}
 		state, err = newSyncState(cfg.syncPaths, cfg.source, cfg.dest, cfg.lockTimeout, cfg.lockWait, consistentWrites, cfg.failOnIncomplete, cfg.logs, logger, runner, cfg.persistentLock)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "rclonewatch: initialize sync state: %v\n", err)
+			logger.Printf("initialize sync state: %v", err)
 			return 1
 		}
 		state.excludes = append([]string(nil), cfg.excludes...)
@@ -342,13 +342,13 @@ func run(cfg config) (exitCode int) {
 			if errors.Is(err, errLockInterrupted) {
 				return 0
 			}
-			fmt.Fprintf(os.Stderr, "rclonewatch: acquire lock: %v\n", err)
+			logger.Printf("acquire lock: %v", err)
 			return 1
 		}
 		lockErrors = state.Start()
 		defer func() {
 			if err := state.Close(); err != nil {
-				fmt.Fprintf(os.Stderr, "rclonewatch: release lock: %v\n", err)
+				logger.Printf("release lock: %v", err)
 				exitCode = 1
 			}
 		}()
@@ -356,13 +356,13 @@ func run(cfg config) (exitCode int) {
 
 	if cfg.syncRemote {
 		if err := state.InitializeGeneration(); err != nil {
-			fmt.Fprintf(os.Stderr, "rclonewatch: initialize generation: %v\n", err)
+			logger.Printf("initialize generation: %v", err)
 			return 1
 		}
 		select {
 		case err := <-lockErrors:
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "rclonewatch: lock refresh failed during generation sync: %v\n", err)
+				logger.Printf("lock refresh failed during generation sync: %v", err)
 				return 1
 			}
 		default:
@@ -371,7 +371,7 @@ func run(cfg config) (exitCode int) {
 
 	watcher, err := newWatcher(cfg.source)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "rclonewatch: %v\n", err)
+		logger.Printf("%v", err)
 		return 1
 	}
 
@@ -395,7 +395,7 @@ func run(cfg config) (exitCode int) {
 		wrapped.Stderr = os.Stderr
 		if err := wrapped.Start(); err != nil {
 			watcher.Close()
-			fmt.Fprintf(os.Stderr, "rclonewatch: start wrapped command: %v\n", err)
+			logger.Printf("start wrapped command: %v", err)
 			return 1
 		}
 		done := make(chan error, 1)
@@ -442,18 +442,18 @@ func run(cfg config) (exitCode int) {
 	for {
 		if stopping && watcherClosed && !active && commandDone == nil {
 			if lockErr != nil {
-				fmt.Fprintf(os.Stderr, "rclonewatch: lock refresh failed: %v\n", lockErr)
+				logger.Printf("lock refresh failed: %v", lockErr)
 				return 1
 			}
 			if len(pending) > 0 && !finalAttempted {
 				startSync(true)
 			} else {
 				if watcherErr != nil {
-					fmt.Fprintf(os.Stderr, "rclonewatch: watcher failed: %v\n", watcherErr)
+					logger.Printf("watcher failed: %v", watcherErr)
 					return 1
 				}
 				if len(pending) > 0 {
-					fmt.Fprintf(os.Stderr, "rclonewatch: final sync failed: %v\n", lastSyncErr)
+					logger.Printf("final sync failed: %v", lastSyncErr)
 					return 1
 				}
 				return wrappedExitCode

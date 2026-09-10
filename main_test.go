@@ -479,6 +479,48 @@ func TestWrappedCommandExitStatus(t *testing.T) {
 	}
 }
 
+func TestWrappedCommandStdioPassesThroughWithoutLogs(t *testing.T) {
+	source := t.TempDir()
+	destination := t.TempDir()
+	args := []string{"-test.run=^TestRclonewatchHelper$", "--", source, destination, "--", "sh", "-c", `read value; printf 'stdout:%s\n' "$value"; printf 'stderr:%s\n' "$value" >&2`}
+	cmd := exec.Command(os.Args[0], args...)
+	cmd.Env = append(os.Environ(), "RCLONEWATCH_TEST_HELPER=1")
+	cmd.Stdin = strings.NewReader("input\n")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stdout.String(), "stdout:input\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got, want := stderr.String(), "stderr:input\n"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+}
+
+func TestRuntimeErrorsRequireLogs(t *testing.T) {
+	source := t.TempDir()
+	destination := t.TempDir()
+	args := []string{"-test.run=^TestRclonewatchHelper$", "--", source, destination, "--", filepath.Join(t.TempDir(), "missing-command")}
+	cmd := exec.Command(os.Args[0], args...)
+	cmd.Env = append(os.Environ(), "RCLONEWATCH_TEST_HELPER=1")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 1 {
+		t.Fatalf("process error = %v, want exit status 1", err)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("output without --logs: stdout %q, stderr %q", stdout.String(), stderr.String())
+	}
+}
+
 func TestWrappedCommandFinalSync(t *testing.T) {
 	if _, err := exec.LookPath("rclone"); err != nil {
 		t.Skip("rclone is not installed")

@@ -69,16 +69,18 @@ Options:
         state outside a root. Sync path options require --use-lock.
 
   --logs
-        Write status, changed paths, and rclone output to stdout.
+        Write diagnostics, status, changed paths, and rclone output to stdout.
+        Without this option, rclonewatch writes no runtime output itself.
 
   -h, --help
         Show this help and exit.
 
 Wrapped command:
   Arguments after -- are run as a command once inotify is ready. rclonewatch
-  watches until the command exits, then drains events, performs a final sync,
-  and returns the command's status if syncing succeeds. SIGINT and SIGTERM are
-  forwarded to the command, whose exit is awaited before final shutdown.
+  passes through its standard input, output, and error, watches until it exits,
+  then drains events, performs a final sync, and returns the command's status
+  if syncing succeeds. SIGINT and SIGTERM are forwarded to the command, whose
+  exit is awaited before final shutdown.
 
 Sync file behavior:
   .rcw-sync combines the persistent generation, incomplete-sync flag, and
