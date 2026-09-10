@@ -20,6 +20,7 @@ import (
 const (
 	initialRetryDelay = time.Second
 	maxRetryDelay     = time.Minute
+	defaultLockTTL    = 2 * time.Minute
 )
 
 type config struct {
@@ -29,6 +30,7 @@ type config struct {
 	persistentLock     string
 	excludes           excludePatterns
 	logs               bool
+	uploadOnly         bool
 	forceDeleteRemote  bool
 	failOnIncomplete   bool
 	noConsistentWrites bool
@@ -326,7 +328,7 @@ func run(cfg config) (exitCode int) {
 
 	var state *syncState
 	var lockErrors <-chan error
-	if cfg.lockTimeout > 0 {
+	if !cfg.uploadOnly {
 		consistentWrites, err := useConsistentWrites(cfg.dest, cfg.noConsistentWrites, runner)
 		if err != nil {
 			logger.Printf("configure lock writes: %v", err)
@@ -590,11 +592,12 @@ func parseConfig(args []string) (config, error) {
 	flags := flag.NewFlagSet("rclonewatch", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.DurationVar(&cfg.interval, "interval", 0, "time to wait after a successful sync (for example 30s or 5m)")
-	flags.DurationVar(&cfg.lockTimeout, "use-lock", 0, "coordinate using the remote state file with this expiry timeout")
+	flags.DurationVar(&cfg.lockTimeout, "lock-ttl", defaultLockTTL, "remote lock expiry timeout")
 	flags.Var(&cfg.lockWait, "lock-wait", "maximum time to wait for an active lock: 0, a duration using s/m/h, or inf")
 	flags.StringVar(&cfg.persistentLock, "persistent-lock", "", "continue and retain the lock under this ID")
 	flags.Var(&cfg.excludes, "exclude", "exclude files matching this rclone glob (repeatable)")
 	flags.BoolVar(&cfg.logs, "logs", false, "log sync activity and rclone output to stdout")
+	flags.BoolVar(&cfg.uploadOnly, "upload-only", false, "only upload local changes without using sync state or a remote lock")
 	flags.BoolVar(&cfg.forceDeleteRemote, "force-delete-untracked-remote", false, "delete and initialize a non-empty destination without a state file")
 	flags.BoolVar(&cfg.failOnIncomplete, "fail-on-incomplete-sync", false, "exit if the state file records an incomplete sync")
 	flags.BoolVar(&cfg.noConsistentWrites, "no-consistent-writes", false, "disable conditional lock writes for S3-compatible destinations")
@@ -607,15 +610,15 @@ func parseConfig(args []string) (config, error) {
 	if cfg.interval < 0 {
 		return config{}, errors.New("--interval must not be negative")
 	}
-	lockSet := false
+	lockTTLSet := false
 	lockWaitSet := false
 	persistentLockSet := false
 	stateFileSet := false
 	stateFileLocalSet := false
 	stateFileRemoteSet := false
 	flags.Visit(func(item *flag.Flag) {
-		if item.Name == "use-lock" {
-			lockSet = true
+		if item.Name == "lock-ttl" {
+			lockTTLSet = true
 		}
 		if item.Name == "lock-wait" {
 			lockWaitSet = true
@@ -632,26 +635,11 @@ func parseConfig(args []string) (config, error) {
 			stateFileRemoteSet = true
 		}
 	})
-	if lockSet && cfg.lockTimeout <= 0 {
-		return config{}, errors.New("--use-lock must be greater than zero")
-	}
-	if cfg.forceDeleteRemote && !lockSet {
-		return config{}, errors.New("--force-delete-untracked-remote requires --use-lock with a timeout")
-	}
-	if lockWaitSet && !lockSet {
-		return config{}, errors.New("--lock-wait requires --use-lock with a timeout")
-	}
-	if persistentLockSet && !lockSet {
-		return config{}, errors.New("--persistent-lock requires --use-lock with a timeout")
+	if cfg.lockTimeout <= 0 {
+		return config{}, errors.New("--lock-ttl must be greater than zero")
 	}
 	if persistentLockSet && cfg.persistentLock == "" {
 		return config{}, errors.New("--persistent-lock must not be empty")
-	}
-	if cfg.noConsistentWrites && !lockSet {
-		return config{}, errors.New("--no-consistent-writes requires --use-lock with a timeout")
-	}
-	if cfg.failOnIncomplete && !lockSet {
-		return config{}, errors.New("--fail-on-incomplete-sync requires --use-lock with a timeout")
 	}
 	if stateFileSet && (stateFileLocalSet || stateFileRemoteSet) {
 		return config{}, errors.New("--state-file cannot be combined with --state-file-local or --state-file-remote")
@@ -659,8 +647,23 @@ func parseConfig(args []string) (config, error) {
 	if stateFileLocalSet != stateFileRemoteSet {
 		return config{}, errors.New("--state-file-local and --state-file-remote must be specified together")
 	}
-	if (stateFileSet || stateFileLocalSet) && !lockSet {
-		return config{}, errors.New("state file path options require --use-lock with a timeout")
+	if cfg.uploadOnly {
+		switch {
+		case lockTTLSet:
+			return config{}, errors.New("--lock-ttl cannot be used with --upload-only")
+		case lockWaitSet:
+			return config{}, errors.New("--lock-wait cannot be used with --upload-only")
+		case persistentLockSet:
+			return config{}, errors.New("--persistent-lock cannot be used with --upload-only")
+		case cfg.forceDeleteRemote:
+			return config{}, errors.New("--force-delete-untracked-remote cannot be used with --upload-only")
+		case cfg.noConsistentWrites:
+			return config{}, errors.New("--no-consistent-writes cannot be used with --upload-only")
+		case cfg.failOnIncomplete:
+			return config{}, errors.New("--fail-on-incomplete-sync cannot be used with --upload-only")
+		case stateFileSet || stateFileLocalSet:
+			return config{}, errors.New("state file path options cannot be used with --upload-only")
+		}
 	}
 	if flags.NArg() != 2 {
 		return config{}, errors.New("expected a source folder and rclone destination")
@@ -679,7 +682,7 @@ func parseConfig(args []string) (config, error) {
 	}
 	cfg.source = source
 	cfg.dest = flags.Arg(1)
-	if lockSet {
+	if !cfg.uploadOnly {
 		localRelative, remoteRelative := defaultStateFile, defaultStateFile
 		if stateFileSet {
 			localRelative, remoteRelative = cfg.stateFile, cfg.stateFile

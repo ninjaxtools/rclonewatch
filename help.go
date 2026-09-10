@@ -22,10 +22,9 @@ Options:
         Durations use Go syntax, such as 30s, 5m, or 1h30m. Without this
         option, changes are synced only during shutdown.
 
-  --use-lock TIMEOUT
-        Coordinate writers through the remote .rcw-state JSON file. The lock
-        timestamp is refreshed every TIMEOUT/2. Remote generations are always
-        reconciled at startup. TIMEOUT must be positive.
+  --lock-ttl DURATION
+        Set the remote lock expiry duration. The default is 2m, and the lock
+        timestamp is refreshed every DURATION/2. DURATION must be positive.
 
   --lock-wait 0|DURATION|inf
         How long to wait when an active lock exists. By default, wait for the
@@ -37,7 +36,11 @@ Options:
         Hold the lock under ID and retain it when rclonewatch exits. A later
         invocation using the same ID continues that lock without waiting for
         expiry, refreshing it first only when its normal refresh is due.
-        Requires --use-lock.
+
+  --upload-only
+        Only send local changes to the destination. Do not create, read, or
+        update sync state, acquire a remote lock, or reconcile remote changes.
+        Lock and state options cannot be used in this mode.
 
   --exclude GLOB
         Exclude files matching an rclone filter glob. Repeat this option for
@@ -47,16 +50,17 @@ Options:
         Disable conditional state writes on direct S3-compatible destinations.
         By default S3 writes use If-None-Match/If-Match and require rclone
         v1.73.0 or newer. Use this only for providers without conditional
-        write support.
+        write support. Cannot be used with --upload-only.
 
   --force-delete-untracked-remote
         Initialize a non-empty destination that has no .rcw-state file by
         deleting its existing payload and fully syncing local to remote.
-        Requires --use-lock.
+        Cannot be used with --upload-only.
 
   --fail-on-incomplete-sync
         Exit with status 1 before lock acquisition or remote writes when the
-        local or remote .rcw-state has syncing set to true. Requires --use-lock.
+        local or remote .rcw-state has syncing set to true. Cannot be used with
+        --upload-only.
 
   --state-file PATH
         Use PATH, relative to each root and including the filename, for both
@@ -66,7 +70,8 @@ Options:
   --state-file-remote PATH
         Set different local and remote sync-state paths. Both must be supplied.
         Paths are relative to their respective roots; .. components may place
-        state outside a root. State path options require --use-lock.
+        state outside a root. State path options cannot be used with
+        --upload-only.
 
   --logs
         Write diagnostics, status, changed paths, and rclone output to stdout.
@@ -83,15 +88,16 @@ Wrapped command:
   exit is awaited before final shutdown.
 
 State file behavior:
-  .rcw-state combines the persistent generation, incomplete-sync flag, and
-  optional lock owner/timestamp. Unlocking clears the lock fields but does not
-  delete the file. A destination without remote state must be empty unless
-  --force-delete-untracked-remote is supplied. Initialization locks remote
-  generation 0, clears its payload, fully syncs local to remote, then promotes
-  both state files to generation 1. If local state is absent or older, startup
-  performs a full remote-to-local sync. Equal generations skip it. A completed
-  local generation ahead of remote is an error. Before each outgoing batch,
-  generation is incremented and syncing is set true on both sides before
+  By default, rclonewatch coordinates writers and reconciles remote changes
+  through .rcw-state. It combines the persistent generation, incomplete-sync
+  flag, and optional lock owner/timestamp. Unlocking clears the lock fields but
+  does not delete the file. A destination without remote state must be empty
+  unless --force-delete-untracked-remote is supplied. Initialization locks
+  remote generation 0, clears its payload, fully syncs local to remote, then
+  promotes both state files to generation 1. If local state is absent or older,
+  startup performs a full remote-to-local sync. Equal generations skip it. A
+  completed local generation ahead of remote is an error. Before each outgoing
+  batch, generation is incremented and syncing is set true on both sides before
   payload changes. It is cleared only after the entire batch succeeds, so
   failures remain detectable on the next run. A required remote-to-local sync
   deletes local payload absent remotely.
@@ -107,19 +113,19 @@ Shutdown and retries:
 
 Examples:
   # Wrap a command, periodically sync, and retain a reusable lock.
-  rclonewatch --interval 30s --use-lock 2m \
+  rclonewatch --interval 30s \
     --persistent-lock build-sequence --exclude '*.tmp' --logs \
     /srv/data remote:backup/data -- ./build.sh --release
 
-  # Periodically sync local changes.
-  rclonewatch --interval 5m /srv/data remote:backup/data
+  # Periodically upload local changes without remote reconciliation or state.
+  rclonewatch --upload-only --interval 5m /srv/data remote:backup/data
 
   # Coordinate writers and pull newer remote state before watching.
-  rclonewatch --interval 30s --use-lock 2m --lock-wait inf \
+  rclonewatch --interval 30s --lock-ttl 2m --lock-wait inf \
     --logs /srv/data s3:bucket/data
 
   # Use an S3-compatible provider without conditional-write support.
-  rclonewatch --use-lock 2m --no-consistent-writes \
+  rclonewatch --no-consistent-writes \
     /srv/data s3clone:bucket/data
 `)
 }
