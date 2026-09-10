@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestResolveSyncFilePaths(t *testing.T) {
+func TestResolveStateFilePaths(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "source")
 	tests := []struct {
 		name         string
@@ -39,17 +39,17 @@ func TestResolveSyncFilePaths(t *testing.T) {
 		{
 			name:         "local destination",
 			destination:  filepath.Join(t.TempDir(), "destination"),
-			local:        defaultSyncFile,
-			remote:       defaultSyncFile,
-			wantLocal:    filepath.Join(source, defaultSyncFile),
-			localFilter:  defaultSyncFile,
-			remoteFilter: defaultSyncFile,
+			local:        defaultStateFile,
+			remote:       defaultStateFile,
+			wantLocal:    filepath.Join(source, ".rcw-state"),
+			localFilter:  ".rcw-state",
+			remoteFilter: ".rcw-state",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if test.wantRemote == "" {
-				test.wantRemote = filepath.Join(test.destination, defaultSyncFile)
+				test.wantRemote = filepath.Join(test.destination, ".rcw-state")
 			}
 			got, err := resolveSyncFilePaths(source, test.destination, test.local, test.remote)
 			if err != nil {
@@ -63,7 +63,7 @@ func TestResolveSyncFilePaths(t *testing.T) {
 	}
 }
 
-func TestResolveSyncFilePathsRejectsInvalidNames(t *testing.T) {
+func TestResolveStateFilePathsRejectsInvalidNames(t *testing.T) {
 	for _, paths := range [][2]string{{"", "state"}, {"state", ""}, {"/absolute", "state"}, {"state", "/absolute"}, {".", "state"}, {"state", "."}} {
 		if _, err := resolveSyncFilePaths(t.TempDir(), "remote:root", paths[0], paths[1]); err == nil {
 			t.Fatalf("paths %#v were accepted", paths)

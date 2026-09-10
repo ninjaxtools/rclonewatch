@@ -103,10 +103,10 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 		return err
 	}
 	if s.failOnIncomplete && ((localExists && local.Syncing) || (remote.exists && remote.data.Syncing)) {
-		return errors.New("sync file indicates an incomplete previous sync")
+		return errors.New("state file indicates an incomplete previous sync")
 	}
 	if localExists && !remote.exists {
-		return errors.New("local sync file exists but remote sync file is missing")
+		return errors.New("local state file exists but remote state file is missing")
 	}
 	localIncompleteAdvance := localExists && remote.exists && local.Syncing && local.Generation == remote.data.Generation+1
 	if localExists && local.Generation > remote.data.Generation && !localIncompleteAdvance {
@@ -213,7 +213,7 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 				remote = current
 				continue
 			}
-			return errors.New("remote sync file changed while acquiring lock")
+			return errors.New("remote state file changed while acquiring lock")
 		}
 		if !time.Now().Before(current.data.Lock.Timestamp.Add(s.timeout)) {
 			return errors.New("remote lock timeout elapsed during acquisition")
@@ -382,7 +382,7 @@ func (s *syncState) replaceOwnedRemote(previous remoteSyncFile, candidate syncFi
 		return err
 	}
 	if !latest.ownedBy(s.owner) || latest.lockIdentity() != previous.lockIdentity() || latest.data.Generation != previous.data.Generation || latest.data.Syncing != previous.data.Syncing {
-		return errors.New("remote sync file ownership was lost")
+		return errors.New("remote state file ownership was lost")
 	}
 	if err := s.writeRemote(candidate, latest.etag); err != nil {
 		return err
@@ -392,7 +392,7 @@ func (s *syncState) replaceOwnedRemote(previous remoteSyncFile, candidate syncFi
 		return err
 	}
 	if verified.data.Generation != candidate.Generation || verified.data.Syncing != candidate.Syncing || !sameLock(verified.data.Lock, candidate.Lock) {
-		return errors.New("remote sync file changed while updating it")
+		return errors.New("remote state file changed while updating it")
 	}
 	s.setRemote(verified)
 	return nil
@@ -446,7 +446,7 @@ func (s *syncState) readRemote() (remoteSyncFile, error) {
 	}
 	data, err := decodeSyncFile(stdout.Bytes())
 	if err != nil {
-		return remoteSyncFile{}, fmt.Errorf("invalid remote sync file: %w", err)
+		return remoteSyncFile{}, fmt.Errorf("invalid remote state file: %w", err)
 	}
 	etag := ""
 	if s.consistentWrites {
@@ -538,11 +538,11 @@ func readLocalSyncFile(path string) (syncFileData, bool, error) {
 		return syncFileData{}, false, nil
 	}
 	if err != nil {
-		return syncFileData{}, false, fmt.Errorf("read local sync file: %w", err)
+		return syncFileData{}, false, fmt.Errorf("read local state file: %w", err)
 	}
 	data, err := decodeSyncFile(contents)
 	if err != nil {
-		return syncFileData{}, false, fmt.Errorf("invalid local sync file: %w", err)
+		return syncFileData{}, false, fmt.Errorf("invalid local state file: %w", err)
 	}
 	return data, true, nil
 }

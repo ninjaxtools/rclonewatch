@@ -57,9 +57,14 @@ func TestExcludePatterns(t *testing.T) {
 func TestHelpIncludesOptionsAndExamples(t *testing.T) {
 	var output bytes.Buffer
 	printHelp(&output)
-	for _, text := range []string{"--interval", "--use-lock", "--lock-wait", "--persistent-lock", "--exclude", "--no-consistent-writes", "--sync-remote", "--fail-on-incomplete-sync", "--sync-file", "--sync-file-local", "--sync-file-remote", "--logs", "Wrapped command:", "Sync file behavior:", "Examples:"} {
+	for _, text := range []string{"--interval", "--use-lock", "--lock-wait", "--persistent-lock", "--exclude", "--no-consistent-writes", "--reconcile-remote-changes", "--fail-on-incomplete-sync", "--state-file", "--state-file-local", "--state-file-remote", "--logs", "Wrapped command:", "State file behavior:", "Examples:"} {
 		if !strings.Contains(output.String(), text) {
 			t.Errorf("help does not contain %q", text)
+		}
+	}
+	for _, text := range []string{"--sync-remote", "--sync-file", ".rcw-sync"} {
+		if strings.Contains(output.String(), text) {
+			t.Errorf("help contains renamed value %q", text)
 		}
 	}
 }

@@ -115,10 +115,10 @@ func newMemoryState(t *testing.T, runner *memorySyncRunner, timeout time.Duratio
 	t.Helper()
 	source := t.TempDir()
 	paths := syncFilePaths{
-		local:        filepath.Join(source, defaultSyncFile),
-		remote:       "remote:destination/" + defaultSyncFile,
-		localFilter:  defaultSyncFile,
-		remoteFilter: defaultSyncFile,
+		local:        filepath.Join(source, defaultStateFile),
+		remote:       "remote:destination/" + defaultStateFile,
+		localFilter:  defaultStateFile,
+		remoteFilter: defaultStateFile,
 	}
 	id := ""
 	if len(persistentID) > 0 {
@@ -135,7 +135,7 @@ func TestSyncStateLifecycleWithLocalRclone(t *testing.T) {
 	requireRclone(t)
 	source := t.TempDir()
 	destination := t.TempDir()
-	paths, err := resolveSyncFilePaths(source, destination, defaultSyncFile, defaultSyncFile)
+	paths, err := resolveSyncFilePaths(source, destination, defaultStateFile, defaultStateFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,8 +543,8 @@ func TestSyncStateInitializeGeneration(t *testing.T) {
 	t.Run("remote ahead", func(t *testing.T) {
 		source := t.TempDir()
 		destination := t.TempDir()
-		writeSyncState(t, filepath.Join(source, defaultSyncFile), syncFileData{Generation: 1})
-		writeSyncState(t, filepath.Join(destination, defaultSyncFile), syncFileData{Generation: 2})
+		writeSyncState(t, filepath.Join(source, defaultStateFile), syncFileData{Generation: 1})
+		writeSyncState(t, filepath.Join(destination, defaultStateFile), syncFileData{Generation: 2})
 		writeTestFile(t, filepath.Join(source, "local-only.txt"), "local")
 		writeTestFile(t, filepath.Join(destination, "remote.txt"), "remote")
 		state := acquireLocalState(t, source, destination)
@@ -564,8 +564,8 @@ func TestSyncStateInitializeGeneration(t *testing.T) {
 	t.Run("equal", func(t *testing.T) {
 		source := t.TempDir()
 		destination := t.TempDir()
-		writeSyncState(t, filepath.Join(source, defaultSyncFile), syncFileData{Generation: 3})
-		writeSyncState(t, filepath.Join(destination, defaultSyncFile), syncFileData{Generation: 3})
+		writeSyncState(t, filepath.Join(source, defaultStateFile), syncFileData{Generation: 3})
+		writeSyncState(t, filepath.Join(destination, defaultStateFile), syncFileData{Generation: 3})
 		writeTestFile(t, filepath.Join(source, "local-only.txt"), "local")
 		writeTestFile(t, filepath.Join(destination, "remote-only.txt"), "remote")
 		state := acquireLocalState(t, source, destination)
@@ -594,17 +594,17 @@ func TestSyncStateRejectsInvalidGenerationOrdering(t *testing.T) {
 		wantError  string
 		makeRemote bool
 	}{
-		{name: "local only", local: 1, wantError: "remote sync file is missing"},
+		{name: "local only", local: 1, wantError: "remote state file is missing"},
 		{name: "local ahead", local: 2, remote: 1, makeRemote: true, wantError: "ahead of remote"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			source := t.TempDir()
 			destination := t.TempDir()
-			writeSyncState(t, filepath.Join(source, defaultSyncFile), syncFileData{Generation: test.local})
+			writeSyncState(t, filepath.Join(source, defaultStateFile), syncFileData{Generation: test.local})
 			if test.makeRemote {
-				writeSyncState(t, filepath.Join(destination, defaultSyncFile), syncFileData{Generation: test.remote})
+				writeSyncState(t, filepath.Join(destination, defaultStateFile), syncFileData{Generation: test.remote})
 			}
-			paths, err := resolveSyncFilePaths(source, destination, defaultSyncFile, defaultSyncFile)
+			paths, err := resolveSyncFilePaths(source, destination, defaultStateFile, defaultStateFile)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -650,7 +650,7 @@ func activeForeignState() syncFileData {
 
 func acquireLocalState(t *testing.T, source, destination string) *syncState {
 	t.Helper()
-	paths, err := resolveSyncFilePaths(source, destination, defaultSyncFile, defaultSyncFile)
+	paths, err := resolveSyncFilePaths(source, destination, defaultStateFile, defaultStateFile)
 	if err != nil {
 		t.Fatal(err)
 	}

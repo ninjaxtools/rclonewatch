@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const defaultSyncFile = ".rcw-sync"
+const defaultStateFile = ".rcw-state"
 
 type syncFilePaths struct {
 	local        string
@@ -30,14 +30,14 @@ func resolveSyncFilePaths(source, destination, localRelative, remoteRelative str
 
 func resolveLocalSyncFile(root, relative string) (string, string, error) {
 	if relative == "" || filepath.IsAbs(relative) {
-		return "", "", errors.New("local sync file path must be a non-empty relative path")
+		return "", "", errors.New("local state file path must be a non-empty relative path")
 	}
 	resolved, err := filepath.Abs(filepath.Join(root, filepath.FromSlash(relative)))
 	if err != nil {
 		return "", "", err
 	}
 	if resolved == filepath.Clean(root) {
-		return "", "", errors.New("local sync file path resolves to the source directory")
+		return "", "", errors.New("local state file path resolves to the source directory")
 	}
 	filter := relativeLocalPath(root, resolved)
 	return resolved, filter, nil
@@ -45,13 +45,13 @@ func resolveLocalSyncFile(root, relative string) (string, string, error) {
 
 func resolveRemoteSyncFile(root, relative string) (string, string, error) {
 	if relative == "" || path.IsAbs(relative) {
-		return "", "", errors.New("remote sync file path must be a non-empty relative path")
+		return "", "", errors.New("remote state file path must be a non-empty relative path")
 	}
 	colon := remoteColon(root)
 	if colon < 0 {
 		resolved := filepath.Clean(filepath.Join(root, filepath.FromSlash(relative)))
 		if resolved == filepath.Clean(root) {
-			return "", "", errors.New("remote sync file path resolves to the destination directory")
+			return "", "", errors.New("remote state file path resolves to the destination directory")
 		}
 		return resolved, relativeLocalPath(root, resolved), nil
 	}
@@ -61,7 +61,7 @@ func resolveRemoteSyncFile(root, relative string) (string, string, error) {
 	rootPath := path.Clean("/" + remoteRoot)
 	resolvedPath := path.Clean(path.Join(rootPath, relative))
 	if resolvedPath == rootPath {
-		return "", "", errors.New("remote sync file path resolves to the destination directory")
+		return "", "", errors.New("remote state file path resolves to the destination directory")
 	}
 	filter := relativeSlashPath(rootPath, resolvedPath)
 	if strings.HasPrefix(remoteRoot, "/") {

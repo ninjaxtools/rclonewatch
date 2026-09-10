@@ -23,7 +23,7 @@ Options:
         option, changes are synced only during shutdown.
 
   --use-lock TIMEOUT
-        Coordinate writers through the remote .rcw-sync JSON file. The lock
+        Coordinate writers through the remote .rcw-state JSON file. The lock
         timestamp is refreshed every TIMEOUT/2. TIMEOUT must be positive.
 
   --lock-wait 0|DURATION|inf
@@ -40,7 +40,8 @@ Options:
 
   --exclude GLOB
         Exclude files matching an rclone filter glob. Repeat this option for
-        multiple patterns. Applies to outgoing syncs and --sync-remote.
+        multiple patterns. Applies to outgoing syncs and
+        --reconcile-remote-changes.
 
   --no-consistent-writes
         Disable conditional state writes on direct S3-compatible destinations.
@@ -48,25 +49,25 @@ Options:
         v1.73.0 or newer. Use this only for providers without conditional
         write support.
 
-  --sync-remote
+  --reconcile-remote-changes
         Reconcile remote changes into SOURCE_FOLDER at startup using
-        .rcw-sync generations. Requires --use-lock. A full remote-to-local
+        .rcw-state generations. Requires --use-lock. A full remote-to-local
         sync runs only when the remote generation is newer or local state is
         absent.
 
   --fail-on-incomplete-sync
         Exit with status 1 before lock acquisition or remote writes when the
-        local or remote .rcw-sync has syncing set to true. Requires --use-lock.
+        local or remote .rcw-state has syncing set to true. Requires --use-lock.
 
-  --sync-file PATH
+  --state-file PATH
         Use PATH, relative to each root and including the filename, for both
         local and remote sync state. Cannot be combined with the path pair.
 
-  --sync-file-local PATH
-  --sync-file-remote PATH
+  --state-file-local PATH
+  --state-file-remote PATH
         Set different local and remote sync-state paths. Both must be supplied.
         Paths are relative to their respective roots; .. components may place
-        state outside a root. Sync path options require --use-lock.
+        state outside a root. State path options require --use-lock.
 
   --logs
         Write diagnostics, status, changed paths, and rclone output to stdout.
@@ -82,16 +83,17 @@ Wrapped command:
   if syncing succeeds. SIGINT and SIGTERM are forwarded to the command, whose
   exit is awaited before final shutdown.
 
-Sync file behavior:
-  .rcw-sync combines the persistent generation, incomplete-sync flag, and
+State file behavior:
+  .rcw-state combines the persistent generation, incomplete-sync flag, and
   optional lock owner/timestamp. Unlocking clears the lock fields but does not
-  delete the file. If local state is absent or older, --sync-remote performs a
-  full remote-to-local sync. Equal generations skip it. A missing remote state
-  when local state exists, or a completed local generation ahead of remote, is
-  an error. Before each outgoing batch, generation is incremented and syncing
-  is set true on both sides before payload changes. It is cleared only after
-  the entire batch succeeds, so failures remain detectable on the next run.
-  A required remote-to-local sync deletes local payload absent remotely.
+  delete the file. If local state is absent or older,
+  --reconcile-remote-changes performs a full remote-to-local sync. Equal
+  generations skip it. A missing remote state when local state exists, or a
+  completed local generation ahead of remote, is an error. Before each outgoing
+  batch, generation is incremented and syncing is set true on both sides before
+  payload changes. It is cleared only after the entire batch succeeds, so
+  failures remain detectable on the next run. A required remote-to-local sync
+  deletes local payload absent remotely.
 
   State paths inside either payload root are excluded from payload transfers.
   When local and remote paths differ, both relative names are reserved.
@@ -113,7 +115,7 @@ Examples:
 
   # Coordinate writers and pull newer remote state before watching.
   rclonewatch --interval 30s --use-lock 2m --lock-wait inf \
-    --sync-remote --logs /srv/data s3:bucket/data
+    --reconcile-remote-changes --logs /srv/data s3:bucket/data
 
   # Use an S3-compatible provider without conditional-write support.
   rclonewatch --use-lock 2m --no-consistent-writes \
