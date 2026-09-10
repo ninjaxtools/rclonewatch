@@ -24,18 +24,21 @@ Options:
 
   --lock-ttl DURATION
         Set the remote lock expiry duration. The default is 2m, and the lock
-        timestamp is refreshed every DURATION/2. DURATION must be positive.
+        timestamp is refreshed every DURATION/2. The TTL is stored with the
+        lock. DURATION must be positive.
 
   --lock-wait 0|DURATION|inf
         How long to wait when an active lock exists. By default, wait for the
         observed lock to expire but fail if it is refreshed. An explicit 0
         exits immediately. A duration waits up to that total time while
-        following refreshes. inf waits indefinitely. Units are s, m, h.
+        following refreshes. Lock expiry is measured locally from observation
+        using the stored TTL, never from the lock timestamp, to avoid clock
+        skew. inf waits indefinitely. Units are s, m, h.
 
   --persistent-lock ID
         Hold the lock under ID and retain it when rclonewatch exits. A later
         invocation using the same ID continues that lock without waiting for
-        expiry, refreshing it first only when its normal refresh is due.
+        expiry and immediately refreshes it with the configured TTL.
 
   --upload-only
         Only send local changes to the destination. Do not create, read, or
@@ -90,10 +93,10 @@ Wrapped command:
 State file behavior:
   By default, rclonewatch coordinates writers and reconciles remote changes
   through .rcw-state. It combines the persistent generation, incomplete-sync
-  flag, and optional lock owner/timestamp. Unlocking clears the lock fields but
-  does not delete the file. A destination without remote state must be empty
-  unless --force-delete-untracked-remote is supplied. Initialization locks
-  remote generation 0, clears its payload, fully syncs local to remote, then
+  flag, and optional lock owner, timestamp, and TTL. Unlocking clears the lock
+  fields but does not delete the file. A destination without remote state must
+  be empty unless --force-delete-untracked-remote is supplied. Initialization
+  locks remote generation 0, clears its payload, fully syncs local to remote, then
   promotes both state files to generation 1. If local state is absent or older,
   startup performs a full remote-to-local sync. Equal generations skip it. A
   completed local generation ahead of remote is an error. Before each outgoing
@@ -107,9 +110,12 @@ State file behavior:
 
 Shutdown and retries:
   Failed running syncs retry with exponential backoff from 1 second to 1
-  minute. SIGINT or SIGTERM drains queued inotify events, performs a final
-  sync, clears an owned non-persistent lock, and exits. Runtime failures use
-  status 1 and usage errors status 2.
+  minute. Failed lock refreshes retry until shortly before the current lock
+  expires. If ownership is lost or the lock cannot be refreshed by then,
+  active rclone work and the wrapped command are terminated without a final
+  sync. SIGINT or SIGTERM drains queued inotify events, performs a final sync,
+  clears an owned non-persistent lock, and exits. Runtime failures use status 1
+  and usage errors status 2.
 
 Examples:
   # Wrap a command, periodically sync, and retain a reusable lock.

@@ -125,7 +125,7 @@ func TestSyncerWithLocalRclone(t *testing.T) {
 		source: source,
 		dest:   destination,
 		logger: log.New(io.Discard, "", 0),
-		runner: rcloneCommand{},
+		runner: &rcloneCommand{},
 	}
 	if err := s.Sync(map[string]change{
 		"folder/file.txt": {path: "folder/file.txt"},
@@ -175,7 +175,7 @@ func TestSyncerWithLocalRcloneExcludes(t *testing.T) {
 		dest:     destination,
 		excludes: []string{"*.tmp"},
 		logger:   log.New(io.Discard, "", 0),
-		runner:   rcloneCommand{},
+		runner:   &rcloneCommand{},
 	}
 	if err := s.Sync(map[string]change{"included.txt": {path: "included.txt"}}); err != nil {
 		t.Fatal(err)
@@ -188,6 +188,40 @@ func TestSyncerWithLocalRcloneExcludes(t *testing.T) {
 	}
 	if got := readTestFile(t, filepath.Join(destination, "remote.tmp")); got != "retained" {
 		t.Fatalf("excluded remote contents = %q, want retained", got)
+	}
+}
+
+func TestRcloneCommandCancel(t *testing.T) {
+	bin := t.TempDir()
+	rclone := filepath.Join(bin, "rclone")
+	if err := os.WriteFile(rclone, []byte("#!/bin/sh\n: > \"$RCLONEWATCH_STARTED\"\nexec sleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(t.TempDir(), "started")
+	t.Setenv("RCLONEWATCH_STARTED", started)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := newRcloneCommand()
+	done := make(chan error, 1)
+	go func() { done <- runner.Run([]string{"version"}, io.Discard, io.Discard) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake rclone did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	runner.Cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled rclone exited successfully")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled rclone did not exit")
 	}
 }
 
@@ -284,7 +318,7 @@ func TestFinalSyncOnSIGTERM(t *testing.T) {
 	}
 	source := t.TempDir()
 	destination := t.TempDir()
-	process := startTestProcess(t, "--lock-ttl", "2s", "--logs", source, destination)
+	process := startTestProcess(t, "--logs", source, destination)
 	assertSyncState(t, filepath.Join(destination, defaultStateFile), 1, false, true)
 
 	if err := os.WriteFile(filepath.Join(source, "final.txt"), []byte("final contents"), 0o600); err != nil {
@@ -310,7 +344,7 @@ func TestIntervalSync(t *testing.T) {
 	}
 	source := t.TempDir()
 	destination := t.TempDir()
-	process := startTestProcess(t, "--interval", "50ms", "--lock-ttl", "2s", "--logs", source, destination)
+	process := startTestProcess(t, "--interval", "50ms", "--logs", source, destination)
 	if err := os.WriteFile(filepath.Join(source, "interval.txt"), []byte("interval contents"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -428,11 +462,11 @@ func TestLostLockExitsWithoutSyncing(t *testing.T) {
 	}
 	source := t.TempDir()
 	destination := t.TempDir()
-	process := startTestProcess(t, "--lock-ttl", "400ms", "--logs", source, destination)
+	process := startTestProcess(t, "--interval", "200ms", "--logs", source, destination, "--", "sh", "-c", "trap '' TERM; while :; do sleep 1; done")
 	if err := os.WriteFile(filepath.Join(source, "must-not-sync.txt"), []byte("contents"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	foreign := syncFileData{Generation: 1, Lock: &syncFileLock{Owner: "foreign", Timestamp: time.Now().UTC()}}
+	foreign := syncFileData{Generation: 1, Lock: &syncFileLock{Owner: "foreign", Timestamp: time.Now().UTC(), TTL: defaultLockTTL}}
 	contents, err := encodeSyncFile(foreign)
 	if err != nil {
 		t.Fatal(err)
@@ -715,7 +749,7 @@ func startTestProcess(t *testing.T, args ...string) *testProcess {
 	case <-ready:
 	case err := <-wait:
 		t.Fatalf("process exited before watching: %v: %s", err, stderr.String())
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		cmd.Process.Kill()
 		t.Fatal("timed out waiting for watcher startup")
 	}

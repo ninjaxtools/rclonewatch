@@ -22,7 +22,10 @@ type memorySyncRunner struct {
 	value               string
 	lastCopyArgs        []string
 	copyCount           int
+	copyAttempts        int
 	conditionalFailures int
+	refreshFailures     int
+	ambiguousFailures   int
 	payloadErr          error
 	payloadRan          bool
 	requireGeneration   uint64
@@ -55,6 +58,11 @@ func (r *memorySyncRunner) Run(args []string, stdout, stderr io.Writer) error {
 		_, err := io.WriteString(stdout, r.value+"\n")
 		return err
 	case "copyto":
+		r.copyAttempts++
+		if r.refreshFailures > 0 {
+			r.refreshFailures--
+			return errors.New("transient refresh failure")
+		}
 		if r.conditionalFailures > 0 {
 			r.conditionalFailures--
 			r.value = encodeTestSyncFile(syncFileData{
@@ -73,6 +81,10 @@ func (r *memorySyncRunner) Run(args []string, stdout, stderr io.Writer) error {
 		r.value = strings.TrimSpace(string(contents))
 		r.lastCopyArgs = append([]string(nil), args...)
 		r.copyCount++
+		if r.ambiguousFailures > 0 {
+			r.ambiguousFailures--
+			return errors.New("ambiguous write failure")
+		}
 		return nil
 	default:
 		data, err := decodeSyncFile([]byte(r.value))
@@ -119,6 +131,41 @@ func (r *memorySyncRunner) writes() int {
 	return r.copyCount
 }
 
+func (r *memorySyncRunner) attempts() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.copyAttempts
+}
+
+func (r *memorySyncRunner) setRefreshFailures(count int) {
+	r.mu.Lock()
+	r.refreshFailures = count
+	r.mu.Unlock()
+}
+
+func (r *memorySyncRunner) setAmbiguousFailures(count int) {
+	r.mu.Lock()
+	r.ambiguousFailures = count
+	r.mu.Unlock()
+}
+
+type blockingRefreshRunner struct {
+	*memorySyncRunner
+	block   <-chan struct{}
+	started chan struct{}
+	enabled bool
+	once    sync.Once
+}
+
+func (r *blockingRefreshRunner) Run(args []string, stdout, stderr io.Writer) error {
+	if args[0] == "copyto" && r.enabled {
+		r.once.Do(func() { close(r.started) })
+		<-r.block
+		return errors.New("blocked refresh cancelled")
+	}
+	return r.memorySyncRunner.Run(args, stdout, stderr)
+}
+
 func newMemoryState(t *testing.T, runner *memorySyncRunner, timeout time.Duration, wait lockWait, consistent, failOnIncomplete bool, persistentID ...string) (*syncState, string) {
 	t.Helper()
 	source := t.TempDir()
@@ -147,7 +194,7 @@ func TestSyncStateLifecycleWithLocalRclone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := newSyncState(paths, source, destination, 500*time.Millisecond, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{}, "")
+	state, err := newSyncState(paths, source, destination, 10*time.Second, lockWait{}, false, false, false, log.New(io.Discard, "", 0), &rcloneCommand{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,29 +209,244 @@ func TestSyncStateLifecycleWithLocalRclone(t *testing.T) {
 	if err != nil || initial.Lock == nil {
 		t.Fatalf("initial remote state = %#v, err = %v", initial, err)
 	}
-	errors := state.errors
-
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		current, _, readErr := readLocalSyncFile(paths.remote)
-		if readErr == nil && current.Lock != nil && current.Lock.Timestamp.After(initial.Lock.Timestamp) {
-			break
-		}
-		select {
-		case refreshErr := <-errors:
-			t.Fatalf("refresh failed: %v", refreshErr)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("lock timestamp was not refreshed")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 
 	if err := state.Close(); err != nil {
 		t.Fatal(err)
 	}
 	assertSyncState(t, paths.remote, 1, false, false)
+}
+
+func TestSyncStateRetriesLockRefresh(t *testing.T) {
+	runner := &memorySyncRunner{}
+	runner.setData(syncFileData{Generation: 1})
+	state, _ := newMemoryState(t, runner, 200*time.Millisecond, lockWait{}, false, false)
+	state.pollInterval = 10 * time.Millisecond
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	initialAttempts := runner.attempts()
+	runner.setRefreshFailures(2)
+	errors := state.Start()
+
+	deadline := time.Now().Add(time.Second)
+	for runner.writes() < 2 {
+		select {
+		case err := <-errors:
+			t.Fatalf("refresh failed instead of retrying: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lock refresh did not recover")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if attempts := runner.attempts() - initialAttempts; attempts < 3 {
+		t.Fatalf("refresh attempts = %d, want at least 3", attempts)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncStateRecoversAmbiguousLockRefresh(t *testing.T) {
+	runner := &memorySyncRunner{}
+	runner.setData(syncFileData{Generation: 1})
+	state, _ := newMemoryState(t, runner, 200*time.Millisecond, lockWait{}, false, false)
+	state.pollInterval = 10 * time.Millisecond
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	initialAttempts := runner.attempts()
+	runner.setAmbiguousFailures(1)
+	errors := state.Start()
+
+	deadline := time.Now().Add(time.Second)
+	for runner.attempts()-initialAttempts < 2 {
+		select {
+		case err := <-errors:
+			t.Fatalf("ambiguous refresh was treated as ownership loss: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ambiguous refresh was not recovered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncStatePreservesAmbiguousRefreshDuringStateUpdate(t *testing.T) {
+	runner := &memorySyncRunner{}
+	runner.setData(syncFileData{Generation: 1})
+	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	previous := state.getRemote()
+	candidate := previous.data
+	candidate.Lock = state.newLock()
+	runner.setAmbiguousFailures(1)
+	state.updateMu.Lock()
+	err := state.replaceOwnedRemote(previous, candidate)
+	state.updateMu.Unlock()
+	if err == nil {
+		t.Fatal("ambiguous refresh unexpectedly succeeded")
+	}
+	refreshed := runner.data(t)
+	if sameLock(refreshed.Lock, previous.data.Lock) {
+		t.Fatal("ambiguous refresh did not change the remote lock")
+	}
+
+	if err := state.BeforeRemoteChange(); err != nil {
+		t.Fatal(err)
+	}
+	remote := runner.data(t)
+	if remote.Generation != 2 || !sameLock(remote.Lock, refreshed.Lock) {
+		t.Fatalf("state update restored the old lock: %#v", remote)
+	}
+	state.Start()
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncStateAbortsAtRefreshDeadline(t *testing.T) {
+	runner := &memorySyncRunner{}
+	runner.setData(syncFileData{Generation: 1})
+	state, _ := newMemoryState(t, runner, 160*time.Millisecond, lockWait{}, false, false)
+	state.pollInterval = 10 * time.Millisecond
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	runner.setRefreshFailures(100)
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	state.cancelCommands = func() { cancelOnce.Do(func() { close(cancelled) }) }
+
+	select {
+	case err := <-state.Start():
+		if err == nil || !strings.Contains(err.Error(), "before expiry") {
+			t.Fatalf("refresh error = %v, want expiry error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refresh failure did not reach its deadline")
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("commands were not cancelled")
+	}
+	if attempts := runner.attempts(); attempts < 3 {
+		t.Fatalf("total lock write attempts = %d, want at least 3", attempts)
+	}
+
+	runner.setRefreshFailures(0)
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncStateAbortsBlockedRefreshAtDeadline(t *testing.T) {
+	block := make(chan struct{})
+	runner := &blockingRefreshRunner{
+		memorySyncRunner: &memorySyncRunner{},
+		block:            block,
+		started:          make(chan struct{}),
+	}
+	runner.setData(syncFileData{Generation: 1})
+	state, _ := newMemoryState(t, runner.memorySyncRunner, 160*time.Millisecond, lockWait{}, false, false)
+	state.runner = runner
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	runner.enabled = true
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	state.cancelCommands = func() {
+		cancelOnce.Do(func() {
+			close(cancelled)
+			close(block)
+		})
+	}
+	errors := state.Start()
+
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not start")
+	}
+	select {
+	case err := <-errors:
+		if err == nil || !strings.Contains(err.Error(), "before expiry") {
+			t.Fatalf("refresh error = %v, want expiry error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked refresh was not cancelled at its deadline")
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("commands were not cancelled")
+	}
+	runner.enabled = false
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncStateWatchdogCoversBlockedStateUpdate(t *testing.T) {
+	block := make(chan struct{})
+	runner := &blockingRefreshRunner{
+		memorySyncRunner: &memorySyncRunner{},
+		block:            block,
+		started:          make(chan struct{}),
+	}
+	runner.setData(syncFileData{Generation: 1})
+	state, _ := newMemoryState(t, runner.memorySyncRunner, 160*time.Millisecond, lockWait{}, false, false)
+	state.runner = runner
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	state.cancelCommands = func() {
+		cancelOnce.Do(func() {
+			close(cancelled)
+			close(block)
+		})
+	}
+	errors := state.Start()
+	runner.enabled = true
+	updateDone := make(chan error, 1)
+	go func() { updateDone <- state.BeforeRemoteChange() }()
+
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("state update did not start")
+	}
+	select {
+	case err := <-errors:
+		if err == nil || !strings.Contains(err.Error(), "before expiry") {
+			t.Fatalf("refresh error = %v, want expiry error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked state update was not cancelled at the refresh deadline")
+	}
+	if err := <-updateDone; err == nil {
+		t.Fatal("cancelled state update succeeded")
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("commands were not cancelled")
+	}
+	runner.enabled = false
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSyncStateWaitModes(t *testing.T) {
@@ -204,8 +466,12 @@ func TestSyncStateWaitModes(t *testing.T) {
 
 	t.Run("default expiry", func(t *testing.T) {
 		runner := &memorySyncRunner{}
-		runner.setData(activeForeignState())
-		state, _ := newMemoryState(t, runner, 60*time.Millisecond, lockWait{}, false, false)
+		runner.setData(syncFileData{Generation: 1, Lock: &syncFileLock{
+			Owner:     "foreign",
+			Timestamp: time.Now().Add(24 * time.Hour).UTC(),
+			TTL:       60 * time.Millisecond,
+		}})
+		state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
 		state.pollInterval = 10 * time.Millisecond
 		started := time.Now()
 		if err := state.Acquire(make(chan os.Signal)); err != nil {
@@ -283,7 +549,7 @@ func TestSyncStateWaitModes(t *testing.T) {
 }
 
 func TestPersistentLock(t *testing.T) {
-	t.Run("continues fresh lock without writing", func(t *testing.T) {
+	t.Run("refreshes continued legacy lock", func(t *testing.T) {
 		runner := &memorySyncRunner{}
 		timestamp := time.Now().UTC()
 		runner.setData(syncFileData{Generation: 3, Lock: &syncFileLock{Owner: "sequence", Timestamp: timestamp}})
@@ -291,23 +557,23 @@ func TestPersistentLock(t *testing.T) {
 		if err := state.Acquire(make(chan os.Signal)); err != nil {
 			t.Fatal(err)
 		}
-		if got := runner.writes(); got != 0 {
-			t.Fatalf("remote writes during continuation = %d, want 0", got)
+		if got := runner.writes(); got != 1 {
+			t.Fatalf("remote writes during continuation = %d, want 1", got)
 		}
 		state.Start()
 		if err := state.Close(); err != nil {
 			t.Fatal(err)
 		}
 		remote := runner.data(t)
-		if remote.Lock == nil || remote.Lock.Owner != "sequence" || !remote.Lock.Timestamp.Equal(timestamp) {
-			t.Fatalf("retained lock = %#v, want original sequence lock", remote.Lock)
+		if remote.Lock == nil || remote.Lock.Owner != "sequence" || !remote.Lock.Timestamp.After(timestamp) || remote.Lock.TTL != time.Hour {
+			t.Fatalf("refreshed retained lock = %#v", remote.Lock)
 		}
 	})
 
-	t.Run("refreshes due lock", func(t *testing.T) {
+	t.Run("updates stored TTL", func(t *testing.T) {
 		runner := &memorySyncRunner{}
-		timestamp := time.Now().Add(-time.Hour).UTC()
-		runner.setData(syncFileData{Generation: 2, Lock: &syncFileLock{Owner: "sequence", Timestamp: timestamp}})
+		timestamp := time.Now().UTC()
+		runner.setData(syncFileData{Generation: 2, Lock: &syncFileLock{Owner: "sequence", Timestamp: timestamp, TTL: 2 * time.Hour}})
 		state, _ := newMemoryState(t, runner, time.Hour, lockWait{explicit: true}, false, false, "sequence")
 		if err := state.Acquire(make(chan os.Signal)); err != nil {
 			t.Fatal(err)
@@ -316,7 +582,7 @@ func TestPersistentLock(t *testing.T) {
 			t.Fatalf("remote writes during refresh = %d, want 1", got)
 		}
 		remote := runner.data(t)
-		if remote.Lock == nil || remote.Lock.Owner != "sequence" || !remote.Lock.Timestamp.After(timestamp) {
+		if remote.Lock == nil || remote.Lock.Owner != "sequence" || !remote.Lock.Timestamp.After(timestamp) || remote.Lock.TTL != time.Hour {
 			t.Fatalf("refreshed lock = %#v", remote.Lock)
 		}
 		state.Start()
@@ -339,6 +605,30 @@ func TestPersistentLock(t *testing.T) {
 		}
 		state.Start()
 		if err := state.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("detects another continuation", func(t *testing.T) {
+		runner := &memorySyncRunner{}
+		runner.setData(syncFileData{Generation: 3})
+		first, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false, "sequence")
+		if err := first.Acquire(make(chan os.Signal)); err != nil {
+			t.Fatal(err)
+		}
+		second, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false, "sequence")
+		if err := second.Acquire(make(chan os.Signal)); err != nil {
+			t.Fatal(err)
+		}
+		if err := first.BeforeRemoteChange(); !errors.Is(err, errLockOwnershipLost) {
+			t.Fatalf("state update error = %v, want ownership loss", err)
+		}
+		first.Start()
+		second.Start()
+		if err := first.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := second.Close(); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -433,7 +723,7 @@ func TestEmptyRemoteAcquiresInitializationLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := runner.data(t)
-	if remote.Generation != 0 || remote.Lock == nil || remote.Lock.Owner != state.owner {
+	if remote.Generation != 0 || remote.Lock == nil || remote.Lock.Owner != state.owner || remote.Lock.TTL != time.Hour {
 		t.Fatalf("initial remote state = %#v, want owned generation 0", remote)
 	}
 	state.Start()
@@ -703,7 +993,7 @@ func TestSyncStateRejectsInvalidGenerationOrdering(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			state, err := newSyncState(paths, source, destination, time.Hour, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{}, "")
+			state, err := newSyncState(paths, source, destination, time.Hour, lockWait{}, false, false, false, log.New(io.Discard, "", 0), &rcloneCommand{}, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -739,6 +1029,7 @@ func activeForeignState() syncFileData {
 		Lock: &syncFileLock{
 			Owner:     "foreign-" + time.Now().UTC().Format(time.RFC3339Nano),
 			Timestamp: time.Now().UTC(),
+			TTL:       100 * time.Millisecond,
 		},
 	}
 }
@@ -759,7 +1050,7 @@ func newLocalState(t *testing.T, source, destination string) *syncState {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := newSyncState(paths, source, destination, time.Hour, lockWait{}, false, false, false, log.New(io.Discard, "", 0), rcloneCommand{}, "")
+	state, err := newSyncState(paths, source, destination, time.Hour, lockWait{}, false, false, false, log.New(io.Discard, "", 0), &rcloneCommand{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}

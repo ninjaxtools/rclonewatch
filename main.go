@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -47,10 +48,28 @@ type commandRunner interface {
 	Run(args []string, stdout, stderr io.Writer) error
 }
 
-type rcloneCommand struct{}
+type rcloneCommand struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
 
-func (rcloneCommand) Run(args []string, stdout, stderr io.Writer) error {
-	cmd := exec.Command("rclone", args...)
+func newRcloneCommand() *rcloneCommand {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &rcloneCommand{ctx: ctx, cancel: cancel}
+}
+
+func (r *rcloneCommand) Cancel() {
+	if r.cancel != nil {
+		r.cancel()
+	}
+}
+
+func (r *rcloneCommand) Run(args []string, stdout, stderr io.Writer) error {
+	ctx := r.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, "rclone", args...)
 	if stdout != nil || stderr != nil {
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
@@ -315,12 +334,21 @@ func commandExitCode(err error) int {
 	return 1
 }
 
+func signalCommandGroup(cmd *exec.Cmd, signal os.Signal) error {
+	sig, ok := signal.(syscall.Signal)
+	if !ok {
+		return cmd.Process.Signal(signal)
+	}
+	return syscall.Kill(-cmd.Process.Pid, sig)
+}
+
 func run(cfg config) (exitCode int) {
 	logger := log.New(io.Discard, "rclonewatch: ", log.LstdFlags)
 	if cfg.logs {
 		logger.SetOutput(os.Stdout)
 	}
-	runner := rcloneCommand{}
+	runner := newRcloneCommand()
+	defer runner.Cancel()
 
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
@@ -341,6 +369,7 @@ func run(cfg config) (exitCode int) {
 		}
 		state.excludes = append([]string(nil), cfg.excludes...)
 		state.forceDeleteUntrackedRemote = cfg.forceDeleteRemote
+		state.cancelCommands = runner.Cancel
 		if err := state.Acquire(signals); err != nil {
 			if errors.Is(err, errLockInterrupted) {
 				return 0
@@ -395,6 +424,7 @@ func run(cfg config) (exitCode int) {
 	var commandDone <-chan error
 	if len(cfg.command) > 0 {
 		wrapped = exec.Command(cfg.command[0], cfg.command[1:]...)
+		wrapped.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		wrapped.Stdin = os.Stdin
 		wrapped.Stdout = os.Stdout
 		wrapped.Stderr = os.Stderr
@@ -428,6 +458,20 @@ func run(cfg config) (exitCode int) {
 	retryDelay := initialRetryDelay
 	eventC := watcher.Events()
 	errorC := watcher.Errors()
+	abortForLockFailure := func(err error) {
+		if lockErr != nil {
+			return
+		}
+		lockErr = err
+		runner.Cancel()
+		stopping = true
+		timerC = nil
+		syncReady = false
+		if commandDone != nil {
+			_ = signalCommandGroup(wrapped, syscall.SIGKILL)
+		}
+		watcher.Close()
+	}
 
 	startSync := func(final bool) {
 		if active || len(pending) == 0 {
@@ -493,7 +537,7 @@ func run(cfg config) (exitCode int) {
 				stopping = true
 				timerC = nil
 				if commandDone != nil {
-					_ = wrapped.Process.Signal(syscall.SIGTERM)
+					_ = signalCommandGroup(wrapped, syscall.SIGTERM)
 				}
 				watcher.Close()
 			}
@@ -503,14 +547,7 @@ func run(cfg config) (exitCode int) {
 				continue
 			}
 			if err != nil && lockErr == nil {
-				lockErr = err
-				stopping = true
-				timerC = nil
-				syncReady = false
-				if commandDone != nil {
-					_ = wrapped.Process.Signal(syscall.SIGTERM)
-				}
-				watcher.Close()
+				abortForLockFailure(err)
 			}
 		case <-timerC:
 			timerC = nil
@@ -523,6 +560,10 @@ func run(cfg config) (exitCode int) {
 			active = false
 			lastSyncErr = result.err
 			if result.err != nil {
+				if errors.Is(result.err, errLockOwnershipLost) {
+					abortForLockFailure(result.err)
+					continue
+				}
 				// Events received during the attempt are newer and win.
 				mergeFailedBatch(pending, result.batch)
 				if cfg.logs {
@@ -559,7 +600,7 @@ func run(cfg config) (exitCode int) {
 			watcher.Close()
 		case sig := <-signals:
 			if commandDone != nil {
-				_ = wrapped.Process.Signal(sig)
+				_ = signalCommandGroup(wrapped, sig)
 			}
 			if !stopping {
 				stopping = true

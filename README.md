@@ -55,9 +55,9 @@ Arguments:
 - `SOURCE_FOLDER` is an existing local directory.
 - `RCLONE_DESTINATION` is any destination accepted by rclone.
 - `--interval DURATION` waits that long after each successful sync before starting another. Failed syncs retry with exponential backoff from 1 second to 1 minute. With no interval, changes are synced only during shutdown.
-- `--lock-ttl DURATION` overrides the default two-minute remote lock expiry. The lock timestamp is refreshed at half the TTL.
+- `--lock-ttl DURATION` overrides the default two-minute remote lock expiry. The TTL is stored with the lock, whose timestamp is refreshed at half the TTL.
 - `--lock-wait 0|DURATION|inf` controls how long startup follows an active lock. By default, startup waits for the observed lock to expire but fails if it is refreshed. An explicit `0` exits immediately; durations use `s`, `m`, and `h`; `inf` waits indefinitely.
-- `--persistent-lock ID` uses `ID` as the lock owner and retains the lock on exit. A later invocation with the same ID continues it immediately, refreshing it first only when half the TTL has elapsed.
+- `--persistent-lock ID` uses `ID` as the lock owner and retains the lock on exit. A later invocation with the same ID continues it immediately and refreshes it with the configured TTL.
 - `--upload-only` sends local changes to the destination without creating or reading state, acquiring a lock, or reconciling remote changes. Lock and state options cannot be used with it.
 - `--exclude GLOB` excludes files matching an [rclone filter glob](https://rclone.org/filtering/). Repeat the option to supply multiple patterns. Patterns apply to outgoing payload syncs and startup reconciliation, not sync-state metadata.
 - `--no-consistent-writes` disables conditional state writes for direct S3-compatible destinations. S3 conditional writes are enabled by default and require rclone v1.73.0 or newer.
@@ -72,7 +72,9 @@ Send `SIGINT` or `SIGTERM` to stop watching, finish one final sync, and exit. Wi
 
 ## Locking
 
-Unless `--upload-only` is used, startup waits until the initially observed lock expires, then checks it again and fails if it was refreshed. A finite wait follows refreshed timestamps until its overall deadline; `--lock-wait inf` follows them indefinitely; and `--lock-wait 0` fails immediately. An expired or absent lock is replaced and verified before watching starts. A matching `--persistent-lock` ID bypasses this wait and adopts the existing lock after the initial state read; no write is needed unless its normal half-TTL refresh is due. Refresh failures stop the process without syncing further. Shutdown clears the lock only when its owner and timestamp still match the state last written by this process, except that a persistent lock is retained; `.rcw-state` itself remains.
+Unless `--upload-only` is used, startup waits until the initially observed lock expires, then checks it again and fails if it was refreshed. A finite wait follows refreshed locks until its overall deadline; `--lock-wait inf` follows them indefinitely; and `--lock-wait 0` fails immediately. An expired or absent lock is replaced and verified before watching starts. A matching `--persistent-lock` ID bypasses this wait, adopts the existing lock after the initial state read, and immediately refreshes it with the configured TTL. Transient refresh failures retry until shortly before the current lock expires. If ownership is lost or the lock still cannot be refreshed, active rclone work and the wrapped command are terminated and no final sync is attempted. Shutdown clears the lock only when its owner, timestamp, and TTL still match the state last written by this process, except that a persistent lock is retained; `.rcw-state` itself remains.
+
+Lock expiry is always measured locally by waiting the stored TTL from the time a lock is observed. The recorded timestamp is never used to calculate expiry, preventing clock skew between systems from shortening the wait.
 
 Direct S3 remotes use conditional `If-None-Match` and `If-Match` writes by default. Other backends, and S3 providers used with `--no-consistent-writes`, use advisory write/read ownership verification; all writers must follow the same protocol.
 
@@ -82,7 +84,7 @@ Direct S3 remotes use conditional `If-None-Match` and `If-Match` writes by defau
 
 - `generation` is a positive integer starting at `1`; remote generation `0` is reserved for an initialization in progress and is never written locally.
 - `syncing` is set to `true` locally and remotely, together with an incremented generation, before each outgoing payload batch. It returns to `false` only after every payload operation succeeds.
-- `lock`, while held, contains an opaque owner token (or the supplied persistent ID) and an RFC3339Nano timestamp. Unlocking removes this field while preserving the rest of the state.
+- `lock`, while held, contains an opaque owner token (or the supplied persistent ID), an RFC3339Nano timestamp, and the writer's TTL. Unlocking removes this field while preserving the rest of the state.
 
 By default, startup initializes untracked destinations and reconciles generations as follows:
 

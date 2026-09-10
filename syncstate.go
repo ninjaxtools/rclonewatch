@@ -16,7 +16,10 @@ import (
 	"time"
 )
 
-var errLockInterrupted = errors.New("interrupted while waiting for remote lock")
+var (
+	errLockInterrupted   = errors.New("interrupted while waiting for remote lock")
+	errLockOwnershipLost = errors.New("remote state file ownership was lost")
+)
 
 const lockPollInterval = time.Second
 
@@ -27,8 +30,9 @@ type syncFileData struct {
 }
 
 type syncFileLock struct {
-	Owner     string    `json:"owner"`
-	Timestamp time.Time `json:"timestamp"`
+	Owner     string        `json:"owner"`
+	Timestamp time.Time     `json:"timestamp"`
+	TTL       time.Duration `json:"ttl,omitempty"`
 }
 
 type remoteSyncFile struct {
@@ -53,16 +57,20 @@ type syncState struct {
 	persistent                 bool
 	excludes                   []string
 	forceDeleteUntrackedRemote bool
+	cancelCommands             func()
 
-	mu         sync.Mutex
-	updateMu   sync.Mutex
-	remote     remoteSyncFile
-	stop       chan struct{}
-	done       chan struct{}
-	errors     chan error
-	startOnce  sync.Once
-	closeOnce  sync.Once
-	releaseErr error
+	mu            sync.Mutex
+	updateMu      sync.Mutex
+	remote        remoteSyncFile
+	lockExpiry    time.Time
+	pending       *syncFileData
+	pendingExpiry time.Time
+	stop          chan struct{}
+	done          chan struct{}
+	errors        chan error
+	startOnce     sync.Once
+	closeOnce     sync.Once
+	releaseErr    error
 }
 
 func newSyncState(paths syncFilePaths, source, destination string, timeout time.Duration, wait lockWait, consistentWrites, failOnIncomplete, logs bool, logger *log.Logger, runner commandRunner, persistentID string) (*syncState, error) {
@@ -120,19 +128,13 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 		return fmt.Errorf("local generation %d is ahead of remote generation %d", local.Generation, remote.data.Generation)
 	}
 	if s.persistent && remote.ownedBy(s.owner) {
-		s.setRemote(remote)
-		refreshInterval := max(s.timeout/2, time.Nanosecond)
-		if !time.Now().Before(remote.data.Lock.Timestamp.Add(refreshInterval)) {
-			candidate := remote.data
-			candidate.Lock = &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC()}
-			if err := s.replaceOwnedRemote(remote, candidate); err != nil {
-				return fmt.Errorf("refresh persistent lock: %w", err)
-			}
-			if s.logs {
-				s.logger.Printf("persistent remote lock refreshed")
-			}
-		} else if s.logs {
-			s.logger.Printf("persistent remote lock continued")
+		candidate := remote.data
+		candidate.Lock = s.newLock()
+		if err := s.replaceOwnedRemote(remote, candidate); err != nil {
+			return fmt.Errorf("refresh persistent lock: %w", err)
+		}
+		if s.logs {
+			s.logger.Printf("persistent remote lock continued and refreshed")
 		}
 		return nil
 	}
@@ -144,20 +146,23 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 	defaultWait := !s.wait.explicit && !s.wait.infinite && s.wait.duration == 0
 	canWait := defaultWait || s.wait.infinite || s.wait.duration > 0
 	observedLock := ""
+	var observedAt time.Time
 	for {
-		if defaultWait && observedLock != "" && remote.lockIdentity() != "" && remote.lockIdentity() != observedLock {
-			return errors.New("remote lock was refreshed while waiting")
-		}
-		for remote.active(s.timeout) {
-			if defaultWait && observedLock != "" && remote.lockIdentity() != observedLock {
-				return errors.New("remote lock was refreshed while waiting")
+		for remote.data.Lock != nil {
+			identity := remote.lockIdentity()
+			if observedLock != identity {
+				if defaultWait && observedLock != "" {
+					return errors.New("remote lock was refreshed while waiting")
+				}
+				observedLock = identity
+				observedAt = time.Now()
 			}
-			if defaultWait && observedLock == "" {
-				observedLock = remote.lockIdentity()
+			expires := observedAt.Add(remote.lockTTL(s.timeout))
+			if !time.Now().Before(expires) {
+				break
 			}
-			expires := remote.data.Lock.Timestamp.Add(s.timeout)
 			if !canWait {
-				return fmt.Errorf("remote lock is active until %s", expires.Format(time.RFC3339Nano))
+				return fmt.Errorf("remote lock is active with a stored TTL of %s", remote.lockTTL(s.timeout))
 			}
 			if !deadline.IsZero() && !time.Now().Before(deadline) {
 				return fmt.Errorf("timed out after %s waiting for remote lock", s.wait.duration)
@@ -170,7 +175,7 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 				wakeAt = deadline
 			}
 			if s.logs {
-				s.logger.Printf("remote lock is active until %s; checking again at %s", expires.Format(time.RFC3339Nano), wakeAt.Format(time.RFC3339Nano))
+				s.logger.Printf("remote lock observed with TTL %s; checking again at %s", remote.lockTTL(s.timeout), wakeAt.Format(time.RFC3339Nano))
 			}
 			timer := time.NewTimer(max(time.Until(wakeAt), 0))
 			select {
@@ -186,31 +191,52 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 				return err
 			}
 		}
-		if defaultWait && observedLock != "" && remote.lockIdentity() != "" && remote.lockIdentity() != observedLock {
-			return errors.New("remote lock was refreshed while waiting")
-		}
 
 		candidate := remote.data
-		candidate.Lock = &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC()}
-		if err := s.writeRemote(candidate, remote.etag); err != nil {
-			if s.consistentWrites && canWait {
-				latest, readErr := s.readRemote()
-				if readErr == nil && latest.active(s.timeout) {
-					if defaultWait && observedLock != "" && latest.lockIdentity() != observedLock {
-						return errors.New("remote lock was refreshed while waiting")
-					}
-					remote = latest
-					continue
-				}
+		candidate.Lock = s.newLock()
+		writtenAt := time.Now()
+		verifyDeadline := writtenAt.Add(s.timeout - s.refreshSafetyWindow())
+		watchdogDone := make(chan struct{})
+		watchdog := time.AfterFunc(max(time.Until(verifyDeadline), 0), func() {
+			if s.cancelCommands != nil {
+				s.cancelCommands()
+			}
+			close(watchdogDone)
+		})
+		writeErr := s.writeRemote(candidate, remote.etag)
+		current, err := s.verifyAcquiredLock(verifyDeadline, interrupt)
+		watchdogStopped := watchdog.Stop()
+		if !watchdogStopped {
+			<-watchdogDone
+			return errors.New("could not verify acquired lock before expiry")
+		}
+		if err != nil {
+			if writeErr != nil {
+				return writeErr
 			}
 			return err
 		}
-		current, err := s.readRemote()
-		if err != nil {
-			return err
+		if sameSyncFileData(current.data, candidate) {
+			s.setOwnedRemote(current, writtenAt.Add(s.timeout))
+			if s.logs {
+				s.logger.Printf("remote lock acquired")
+			}
+			return nil
+		}
+		if writeErr != nil {
+			if s.consistentWrites && canWait {
+				if current.lockIdentity() != remote.lockIdentity() {
+					if defaultWait && observedLock != "" && current.lockIdentity() != observedLock {
+						return errors.New("remote lock was refreshed while waiting")
+					}
+					remote = current
+					continue
+				}
+			}
+			return writeErr
 		}
 		if !current.ownedBy(s.owner) || current.data.Generation != candidate.Generation || current.data.Syncing != candidate.Syncing {
-			if canWait && current.active(s.timeout) {
+			if canWait && current.data.Lock != nil {
 				if defaultWait && observedLock != "" && current.lockIdentity() != observedLock {
 					return errors.New("remote lock was refreshed while waiting")
 				}
@@ -219,14 +245,31 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 			}
 			return errors.New("remote state file changed while acquiring lock")
 		}
-		if !time.Now().Before(current.data.Lock.Timestamp.Add(s.timeout)) {
-			return errors.New("remote lock timeout elapsed during acquisition")
+		return errLockOwnershipLost
+	}
+}
+
+func (s *syncState) verifyAcquiredLock(deadline time.Time, interrupt <-chan os.Signal) (remoteSyncFile, error) {
+	var lastErr error
+	for {
+		remote, err := s.readRemote()
+		if err == nil {
+			return remote, nil
 		}
-		s.setRemote(current)
-		if s.logs {
-			s.logger.Printf("remote lock acquired")
+		lastErr = err
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return remoteSyncFile{}, fmt.Errorf("verify acquired lock before expiry: %w", lastErr)
 		}
-		return nil
+		timer := time.NewTimer(min(s.pollInterval, remaining))
+		select {
+		case <-interrupt:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return remoteSyncFile{}, errLockInterrupted
+		case <-timer.C:
+		}
 	}
 }
 
@@ -251,7 +294,6 @@ func (s *syncState) InitializeRemote() error {
 	candidate := remote.data
 	candidate.Generation = 1
 	candidate.Syncing = false
-	candidate.Lock = &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC()}
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("complete remote initialization: %w", err)
 	}
@@ -326,7 +368,6 @@ func (s *syncState) BeforeRemoteChange() error {
 	candidate := remote.data
 	candidate.Generation = next
 	candidate.Syncing = true
-	candidate.Lock = &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC()}
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("publish generation %d: %w", next, err)
 	}
@@ -342,7 +383,6 @@ func (s *syncState) AfterRemoteChange() error {
 	remote := s.getRemote()
 	candidate := remote.data
 	candidate.Syncing = false
-	candidate.Lock = &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC()}
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("clear remote syncing flag: %w", err)
 	}
@@ -393,16 +433,38 @@ func (s *syncState) refreshLoop() {
 		case <-s.stop:
 			return
 		case <-timer.C:
+			watchdog, watchdogResult := s.startRefreshWatchdog()
 			s.updateMu.Lock()
-			remote := s.getRemote()
-			candidate := remote.data
-			candidate.Lock = &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC()}
-			if err := s.replaceOwnedRemote(remote, candidate); err != nil {
+			if s.stopRefreshWatchdog(watchdog, watchdogResult) || s.refreshDeadlinePassed() {
 				s.updateMu.Unlock()
-				s.errors <- err
+				s.failRefresh(errors.New("could not refresh remote lock before expiry"))
 				return
 			}
+			remote := s.getRemote()
+			candidate := remote.data
+			candidate.Lock = s.newLock()
+			watchdog, watchdogResult = s.startRefreshWatchdog()
+			err := s.replaceOwnedRemote(remote, candidate)
+			watchdogExpired := s.stopRefreshWatchdog(watchdog, watchdogResult)
 			s.updateMu.Unlock()
+			if watchdogExpired {
+				s.failRefresh(errors.New("could not refresh remote lock before expiry"))
+				return
+			}
+			if err != nil {
+				if !errors.Is(err, errLockOwnershipLost) {
+					if delay, ok := s.refreshRetryDelay(); ok {
+						if s.logs {
+							s.logger.Printf("remote lock refresh failed; retrying in %s: %v", delay, err)
+						}
+						timer.Reset(delay)
+						continue
+					}
+					err = fmt.Errorf("refresh remote lock before expiry: %w", err)
+				}
+				s.failRefresh(err)
+				return
+			}
 			if s.logs {
 				s.logger.Printf("remote lock refreshed")
 			}
@@ -411,13 +473,68 @@ func (s *syncState) refreshLoop() {
 	}
 }
 
+func (s *syncState) startRefreshWatchdog() (*time.Timer, <-chan bool) {
+	expires := s.getLockExpiry()
+	result := make(chan bool, 1)
+	timer := time.AfterFunc(max(time.Until(expires.Add(-s.refreshSafetyWindow())), 0), func() {
+		expired := !s.getLockExpiry().After(expires)
+		if expired && s.cancelCommands != nil {
+			s.cancelCommands()
+		}
+		result <- expired
+	})
+	return timer, result
+}
+
+func (*syncState) stopRefreshWatchdog(timer *time.Timer, result <-chan bool) bool {
+	if timer.Stop() {
+		return false
+	}
+	return <-result
+}
+
+func (s *syncState) failRefresh(err error) {
+	if s.cancelCommands != nil {
+		s.cancelCommands()
+	}
+	s.errors <- err
+}
+
+func (s *syncState) refreshDeadlinePassed() bool {
+	expires := s.getLockExpiry()
+	if expires.IsZero() {
+		return true
+	}
+	return !time.Now().Before(expires.Add(-s.refreshSafetyWindow()))
+}
+
+func (s *syncState) refreshRetryDelay() (time.Duration, bool) {
+	expires := s.getLockExpiry()
+	if expires.IsZero() {
+		return 0, false
+	}
+	remaining := time.Until(expires.Add(-s.refreshSafetyWindow()))
+	if remaining <= 0 {
+		return 0, false
+	}
+	return min(s.pollInterval, remaining), true
+}
+
+func (s *syncState) refreshSafetyWindow() time.Duration {
+	return max(min(s.timeout/20, time.Second), time.Nanosecond)
+}
+
 func (s *syncState) refreshDelay() time.Duration {
 	interval := max(s.timeout/2, time.Nanosecond)
-	remote := s.getRemote()
-	if remote.data.Lock == nil {
+	expires := s.getLockExpiry()
+	if expires.IsZero() {
 		return 0
 	}
-	return max(time.Until(remote.data.Lock.Timestamp.Add(interval)), 0)
+	return max(time.Until(expires.Add(-s.timeout+interval)), 0)
+}
+
+func (s *syncState) newLock() *syncFileLock {
+	return &syncFileLock{Owner: s.owner, Timestamp: time.Now().UTC(), TTL: s.timeout}
 }
 
 func (s *syncState) replaceOwnedRemote(previous remoteSyncFile, candidate syncFileData) error {
@@ -425,9 +542,29 @@ func (s *syncState) replaceOwnedRemote(previous remoteSyncFile, candidate syncFi
 	if err != nil {
 		return err
 	}
-	if !latest.ownedBy(s.owner) || latest.lockIdentity() != previous.lockIdentity() || latest.data.Generation != previous.data.Generation || latest.data.Syncing != previous.data.Syncing {
-		return errors.New("remote state file ownership was lost")
+	latestIsPrevious := sameSyncFileData(latest.data, previous.data)
+	latestIsPending := s.pending != nil && sameSyncFileData(latest.data, *s.pending)
+	if !latest.ownedBy(s.owner) || (!latestIsPrevious && !latestIsPending) {
+		s.pending = nil
+		s.pendingExpiry = time.Time{}
+		return errLockOwnershipLost
 	}
+	expires := s.getLockExpiry()
+	if latestIsPending {
+		expires = s.pendingExpiry
+		if sameLock(candidate.Lock, previous.data.Lock) {
+			candidate.Lock = latest.data.Lock
+		}
+	}
+	writtenAt := time.Now()
+	if candidate.Lock == nil {
+		expires = time.Time{}
+	} else if !sameLock(candidate.Lock, latest.data.Lock) {
+		expires = writtenAt.Add(candidate.Lock.ttl(s.timeout))
+	}
+	pending := candidate
+	s.pending = &pending
+	s.pendingExpiry = expires
 	if err := s.writeRemote(candidate, latest.etag); err != nil {
 		return err
 	}
@@ -435,10 +572,22 @@ func (s *syncState) replaceOwnedRemote(previous remoteSyncFile, candidate syncFi
 	if err != nil {
 		return err
 	}
-	if verified.data.Generation != candidate.Generation || verified.data.Syncing != candidate.Syncing || !sameLock(verified.data.Lock, candidate.Lock) {
-		return errors.New("remote state file changed while updating it")
+	if !sameSyncFileData(verified.data, candidate) {
+		if sameSyncFileData(verified.data, latest.data) {
+			return errors.New("remote state file changed while updating it")
+		}
+		s.pending = nil
+		s.pendingExpiry = time.Time{}
+		return errLockOwnershipLost
 	}
-	s.setRemote(verified)
+	if candidate.Lock != nil && !verified.ownedBy(s.owner) {
+		s.pending = nil
+		s.pendingExpiry = time.Time{}
+		return errLockOwnershipLost
+	}
+	s.pending = nil
+	s.pendingExpiry = time.Time{}
+	s.setOwnedRemote(verified, expires)
 	return nil
 }
 
@@ -582,14 +731,28 @@ func (s *syncState) getRemote() remoteSyncFile {
 	return s.remote
 }
 
-func (s *syncState) setRemote(remote remoteSyncFile) {
+func (s *syncState) getLockExpiry() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lockExpiry
+}
+
+func (s *syncState) setOwnedRemote(remote remoteSyncFile, expires time.Time) {
 	s.mu.Lock()
 	s.remote = remote
+	s.lockExpiry = expires
 	s.mu.Unlock()
 }
 
-func (r remoteSyncFile) active(timeout time.Duration) bool {
-	return r.exists && r.data.Lock != nil && !time.Now().After(r.data.Lock.Timestamp.Add(timeout))
+func (r remoteSyncFile) lockTTL(fallback time.Duration) time.Duration {
+	return r.data.Lock.ttl(fallback)
+}
+
+func (l *syncFileLock) ttl(fallback time.Duration) time.Duration {
+	if l == nil || l.TTL <= 0 {
+		return fallback
+	}
+	return l.TTL
 }
 
 func (r remoteSyncFile) ownedBy(owner string) bool {
@@ -600,14 +763,18 @@ func (r remoteSyncFile) lockIdentity() string {
 	if r.data.Lock == nil {
 		return ""
 	}
-	return r.data.Lock.Owner + "\x00" + r.data.Lock.Timestamp.Format(time.RFC3339Nano)
+	return r.data.Lock.Owner + "\x00" + r.data.Lock.Timestamp.Format(time.RFC3339Nano) + "\x00" + r.data.Lock.TTL.String()
 }
 
 func sameLock(left, right *syncFileLock) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	return left.Owner == right.Owner && left.Timestamp.Equal(right.Timestamp)
+	return left.Owner == right.Owner && left.Timestamp.Equal(right.Timestamp) && left.TTL == right.TTL
+}
+
+func sameSyncFileData(left, right syncFileData) bool {
+	return left.Generation == right.Generation && left.Syncing == right.Syncing && sameLock(left.Lock, right.Lock)
 }
 
 func readLocalSyncFile(path string) (syncFileData, bool, error) {
@@ -659,6 +826,9 @@ func decodeSyncFile(contents []byte) (syncFileData, error) {
 	}
 	if data.Lock != nil && (data.Lock.Owner == "" || data.Lock.Timestamp.IsZero()) {
 		return syncFileData{}, errors.New("lock owner and timestamp must be set")
+	}
+	if data.Lock != nil && data.Lock.TTL < 0 {
+		return syncFileData{}, errors.New("lock TTL must not be negative")
 	}
 	return data, nil
 }
