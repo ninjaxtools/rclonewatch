@@ -1,14 +1,15 @@
 # rclonewatch
 
-`rclonewatch` watches a local directory recursively with Linux inotify and syncs changed paths to an rclone destination. Changes are deduplicated between runs. Events received while rclone is running are retained for the next run.
+`rclonewatch` watches a local directory recursively with Linux inotify and syncs changed paths to an rclone destination.
 
-The most common invocation wraps the program that changes the watched directory. Here inotify is ready before `./build.sh` starts, changes are synced every 30 seconds except temporary files, and a final sync runs after the command exits. Reusing `build-sequence` in a later invocation continues the same lock without waiting for expiry, and leaves it available for the next invocation after exit.
+The most common mode of operation wraps a program that changes the watched directory. In the following example `./build.sh` is executed through rclonewatch, and changes are synced every 30 seconds (`--interval 30s`), excluding temporary files (`--exclude '*.tmp'`), and a final sync runs after the command exits.
 
 ```sh
-./rclonewatch --interval 30s --use-lock 2m --persistent-lock build-sequence \
-  --reconcile-remote-changes --exclude '*.tmp' --logs \
+./rclonewatch --interval 30s --use-lock 2m --reconcile-remote-changes --exclude '*.tmp' --logs \
   /srv/data remote:backup/data -- ./build.sh --release
 ```
+
+The command is optional and if not provided rclonewatch keeps running until an interrupt is sent to the process which will cause a clean shutdown with a final sync.
 
 ## Installation
 
@@ -110,5 +111,3 @@ Run the minor-version release script from a clean worktree:
 ```sh
 ./publish-minor
 ```
-
-The script pushes the current branch, increments the latest stable version tag from `vMAJOR.MINOR.PATCH` to `vMAJOR.(MINOR+1).0`, and pushes the tag to `origin`. Pushing the tag runs the tests and publishes both Linux binaries with SHA-256 checksums.
