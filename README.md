@@ -13,6 +13,33 @@ Build it with `go build -o rclonewatch .`.
 
 Prebuilt Linux binaries for amd64 and arm64 are attached to each [GitHub release](https://github.com/ninjaxtools/rclonewatch/releases).
 
+For example, an AWS S3 remote can be configured in `~/.config/rclone/rclone.conf` without storing credentials in the file:
+
+```ini
+[s3]
+type = s3
+provider = AWS
+env_auth = true
+region = us-east-1
+```
+
+Alternatively, define the same remote entirely through environment variables without an `rclone.conf` file:
+
+```sh
+export RCLONE_CONFIG_S3_TYPE=s3
+export RCLONE_CONFIG_S3_PROVIDER=AWS
+export RCLONE_CONFIG_S3_ENV_AUTH=true
+export RCLONE_CONFIG_S3_REGION=us-east-1
+```
+
+In either case, set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN` for temporary credentials), then use the config section or environment remote name as the destination:
+
+```sh
+./rclonewatch --interval 30s /srv/data s3:my-bucket/backup/data
+```
+
+For other S3-compatible services, set the provider and endpoint described in [rclone's S3 configuration documentation](https://rclone.org/s3/).
+
 Arguments:
 
 - `SOURCE_FOLDER` is an existing local directory.
