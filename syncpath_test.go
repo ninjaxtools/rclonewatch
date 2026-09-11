@@ -73,7 +73,7 @@ func TestResolveStateFilePathsRejectsInvalidNames(t *testing.T) {
 
 func TestSyncStatePayloadFilters(t *testing.T) {
 	state := &syncState{paths: syncFilePaths{localFilter: ".local/state", remoteFilter: ".remote/state"}}
-	if got, want := state.payloadFilters(), []string{".local/state", ".remote/state"}; !reflect.DeepEqual(got, want) {
+	if got, want := state.payloadFilters(), []string{".local/state.rcw-tmp-*", ".local/state", ".remote/state"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("payloadFilters = %#v, want %#v", got, want)
 	}
 	if exact, ancestor := state.protects(".local/state"); !exact || ancestor {
@@ -81,5 +81,8 @@ func TestSyncStatePayloadFilters(t *testing.T) {
 	}
 	if exact, ancestor := state.protects(".remote"); exact || !ancestor {
 		t.Fatalf("ancestor protection = (%v, %v)", exact, ancestor)
+	}
+	if exact, ancestor := state.protects(".local/state.rcw-tmp-123"); !exact || ancestor {
+		t.Fatalf("temporary state protection = (%v, %v)", exact, ancestor)
 	}
 }

@@ -101,7 +101,7 @@ func (r *memorySyncRunner) Run(args []string, stdout, stderr io.Writer) error {
 		}
 		if r.requireLocalState != "" {
 			local, exists, err := readLocalSyncFile(r.requireLocalState)
-			if err != nil || !exists || data.SyncID == "" || local.SyncID != data.SyncID || local.Generation != data.Generation || !local.Syncing {
+			if err != nil || !exists || data.SyncID == "" || local.SyncID != data.SyncID || local.Generation != data.Generation || !local.Syncing || !local.Active {
 				return fmt.Errorf("payload command observed inconsistent local state: %#v, remote: %#v, error: %v", local, data, err)
 			}
 		}
@@ -1015,6 +1015,7 @@ func TestSyncFromRemoteAppliesExcludes(t *testing.T) {
 	}
 	want := []string{
 		"sync", "remote:destination", "/source", "--create-empty-src-dirs",
+		"--exclude", "/.local-state.rcw-tmp-*",
 		"--exclude", "/.local-state", "--exclude", "/.remote-state",
 		"--exclude", "*.tmp", "--exclude", "/cache/**",
 	}

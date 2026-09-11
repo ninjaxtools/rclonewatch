@@ -21,12 +21,16 @@ var (
 	errLockOwnershipLost = errors.New("remote state file ownership was lost")
 )
 
-const lockPollInterval = time.Second
+const (
+	lockPollInterval     = time.Second
+	localStateTempPrefix = ".rcw-tmp-"
+)
 
 type syncFileData struct {
 	Generation uint64        `json:"generation"`
 	SyncID     string        `json:"sync_id,omitempty"`
 	Syncing    bool          `json:"syncing"`
+	Active     bool          `json:"active,omitempty"` // Local session marker; never published remotely.
 	Lock       *syncFileLock `json:"lock,omitempty"`
 }
 
@@ -112,7 +116,7 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 	if err != nil {
 		return err
 	}
-	if s.failOnIncomplete && ((localExists && local.Syncing) || (remote.exists && remote.data.Syncing)) {
+	if s.failOnIncomplete && ((localExists && (local.Syncing || local.Active)) || (remote.exists && remote.data.Syncing)) {
 		return errors.New("state file indicates an incomplete previous sync")
 	}
 	if !remote.exists && !s.forceDeleteUntrackedRemote {
@@ -299,7 +303,7 @@ func (s *syncState) InitializeRemote() error {
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("complete remote initialization: %w", err)
 	}
-	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: 1, SyncID: candidate.SyncID}); err != nil {
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: 1, SyncID: candidate.SyncID, Active: true}); err != nil {
 		return fmt.Errorf("write initial local state: %w", err)
 	}
 	if s.logs {
@@ -309,14 +313,24 @@ func (s *syncState) InitializeRemote() error {
 }
 
 func (s *syncState) InitializeGeneration() error {
-	if err := s.InitializeRemote(); err != nil {
-		return err
-	}
 	local, localExists, err := readLocalSyncFile(s.paths.local)
 	if err != nil {
 		return err
 	}
+	// Keep the previous marker for the recovery decision, but persist this
+	// session before doing startup work. An absent local state must stay absent
+	// until initialization/download succeeds, so a restart retries that work.
+	if localExists {
+		active := local
+		active.Active = true
+		if err := writeLocalSyncFile(s.paths.local, active); err != nil {
+			return fmt.Errorf("mark local session active: %w", err)
+		}
+	}
 	remote := s.getRemote()
+	if remote.data.Generation == 0 {
+		return s.InitializeRemote()
+	}
 	// An unpublished local advance can collide with another writer's generation.
 	// Only matching sync IDs establish that equal generations describe the same upload.
 	differentSync := local.Generation == remote.data.Generation && local.SyncID != remote.data.SyncID
@@ -334,18 +348,19 @@ func (s *syncState) InitializeGeneration() error {
 		if err := s.syncFromRemote(); err != nil {
 			return err
 		}
-		return writeLocalSyncFile(s.paths.local, syncFileData{Generation: remote.data.Generation, SyncID: remote.data.SyncID, Syncing: remote.data.Syncing})
+		return writeLocalSyncFile(s.paths.local, syncFileData{Generation: remote.data.Generation, SyncID: remote.data.SyncID, Syncing: remote.data.Syncing, Active: true})
 	}
 	localIncompleteAdvance := local.Syncing && local.Generation == remote.data.Generation+1
 	if local.Generation > remote.data.Generation && !localIncompleteAdvance {
 		return fmt.Errorf("local generation %d is ahead of remote generation %d", local.Generation, remote.data.Generation)
 	}
-	if local.Syncing || remote.data.Syncing {
-		if local.Generation == remote.data.Generation && local.SyncID == "" {
+	incomplete := local.Syncing || remote.data.Syncing
+	if incomplete || local.Active {
+		if incomplete && local.Generation == remote.data.Generation && local.SyncID == "" {
 			return errors.New("cannot recover incomplete sync at equal generations without sync IDs; reconcile local and remote payloads manually")
 		}
 		if s.logs {
-			s.logger.Printf("previous sync is incomplete; syncing local to remote")
+			s.logger.Printf("previous sync or session is incomplete; syncing local to remote")
 		}
 		if err := s.BeforeRemoteChange(); err != nil {
 			return err
@@ -373,7 +388,7 @@ func (s *syncState) BeforeRemoteChange() error {
 	}
 	next := remote.data.Generation + 1
 	syncID := rand.Text()
-	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: next, SyncID: syncID, Syncing: true}); err != nil {
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: next, SyncID: syncID, Syncing: true, Active: true}); err != nil {
 		return fmt.Errorf("increment local generation: %w", err)
 	}
 	candidate := remote.data
@@ -398,13 +413,29 @@ func (s *syncState) AfterRemoteChange() error {
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("clear remote syncing flag: %w", err)
 	}
-	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: candidate.Generation, SyncID: candidate.SyncID}); err != nil {
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: candidate.Generation, SyncID: candidate.SyncID, Active: true}); err != nil {
 		return fmt.Errorf("clear local syncing flag: %w", err)
 	}
 	if s.logs {
 		s.logger.Printf("generation %d sync completed", candidate.Generation)
 	}
 	return nil
+}
+
+// FinishSession is called only after the watcher has drained and every pending
+// batch has succeeded. Close alone must not mark a failed session as clean.
+func (s *syncState) FinishSession() error {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	local, exists, err := readLocalSyncFile(s.paths.local)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("local state file is missing at session completion")
+	}
+	local.Active = false
+	return writeLocalSyncFile(s.paths.local, local)
 }
 
 func (s *syncState) Start() <-chan error {
@@ -649,8 +680,9 @@ func (s *syncState) remotePayloadEmpty() (bool, error) {
 }
 
 func (s *syncState) payloadFilters() []string {
-	filters := make([]string, 0, 2)
+	filters := make([]string, 0, 3)
 	if s.paths.localFilter != "" {
+		filters = append(filters, s.paths.localFilter+localStateTempPrefix+"*")
 		filters = append(filters, s.paths.localFilter)
 	}
 	if s.paths.remoteFilter != "" && s.paths.remoteFilter != s.paths.localFilter {
@@ -660,6 +692,9 @@ func (s *syncState) payloadFilters() []string {
 }
 
 func (s *syncState) protects(path string) (exact, ancestor bool) {
+	if s.paths.localFilter != "" && strings.HasPrefix(path, s.paths.localFilter+localStateTempPrefix) {
+		return true, false
+	}
 	for _, filter := range s.payloadFilters() {
 		if path == filter {
 			return true, false
@@ -698,6 +733,7 @@ func (s *syncState) readRemote() (remoteSyncFile, error) {
 }
 
 func (s *syncState) writeRemote(data syncFileData, previousETag string) error {
+	data.Active = false
 	contents, err := encodeSyncFile(data)
 	if err != nil {
 		return err
@@ -811,14 +847,42 @@ func writeLocalSyncFile(path string, data syncFileData) error {
 	if data.Generation == 0 {
 		return errors.New("generation must be at least 1")
 	}
-	contents, err := encodeSyncFile(data)
+	// Local state always includes active, including false after a clean exit.
+	contents, err := json.MarshalIndent(struct {
+		syncFileData
+		Active bool `json:"active"`
+	}{syncFileData: data, Active: data.Active}, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, contents, 0o600)
+	file, err := os.CreateTemp(directory, filepath.Base(path)+localStateTempPrefix+"*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if _, err := file.Write(append(contents, '\n')); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
+		return err
+	}
+	parent, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	return parent.Sync()
 }
 
 func encodeSyncFile(data syncFileData) ([]byte, error) {

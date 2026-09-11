@@ -320,6 +320,7 @@ func TestFinalSyncOnSIGTERM(t *testing.T) {
 	destination := t.TempDir()
 	process := startTestProcess(t, "--logs", source, destination)
 	assertSyncState(t, filepath.Join(destination, defaultStateFile), 1, false, true)
+	assertLocalActive(t, source, true)
 
 	if err := os.WriteFile(filepath.Join(source, "final.txt"), []byte("final contents"), 0o600); err != nil {
 		t.Fatal(err)
@@ -336,6 +337,7 @@ func TestFinalSyncOnSIGTERM(t *testing.T) {
 	}
 	assertSyncState(t, filepath.Join(source, defaultStateFile), 2, false, false)
 	assertSyncState(t, filepath.Join(destination, defaultStateFile), 2, false, false)
+	assertLocalActive(t, source, false)
 }
 
 func TestIntervalSync(t *testing.T) {
@@ -365,6 +367,9 @@ func TestIntervalSync(t *testing.T) {
 		local, localExists, localErr := readLocalSyncFile(filepath.Join(source, defaultStateFile))
 		remote, remoteExists, remoteErr := readLocalSyncFile(filepath.Join(destination, defaultStateFile))
 		if localErr == nil && remoteErr == nil && localExists && remoteExists && local.Generation >= 2 && local.Generation == remote.Generation && !local.Syncing && !remote.Syncing && remote.Lock != nil {
+			if !local.Active || remote.Active {
+				t.Fatalf("active marker after interval sync: local=%v remote=%v", local.Active, remote.Active)
+			}
 			break
 		}
 		if time.Now().After(deadline) {
@@ -379,6 +384,7 @@ func TestIntervalSync(t *testing.T) {
 	if err := process.waitForExit(t); err != nil {
 		t.Fatalf("process exit: %v: %s", err, process.stderr.String())
 	}
+	assertLocalActive(t, source, false)
 }
 
 func TestReconcilesRemoteChangesAtStartup(t *testing.T) {
@@ -487,6 +493,7 @@ func TestLostLockExitsWithoutSyncing(t *testing.T) {
 	if err != nil || !exists || got.Lock == nil || got.Lock.Owner != "foreign" {
 		t.Fatalf("foreign lock was changed or removed: state=%#v exists=%v err=%v", got, exists, err)
 	}
+	assertLocalActive(t, source, true)
 }
 
 func TestParseConfigLockTTL(t *testing.T) {

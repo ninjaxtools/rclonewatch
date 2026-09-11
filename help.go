@@ -62,8 +62,8 @@ Options:
 
   --fail-on-incomplete-sync
         Exit with status 1 before lock acquisition or remote writes when the
-        local or remote .rcw-state has syncing set to true. Cannot be used with
-        --upload-only.
+        local or remote .rcw-state has syncing set to true, or local active is
+        true from an interrupted session. Cannot be used with --upload-only.
 
   --state-file PATH
         Use PATH, relative to each root and including the filename, for both
@@ -102,7 +102,9 @@ State file behavior:
   syncing is true. Equal generations with different sync IDs also trigger a
   remote-to-local sync.
   Matching generations and sync IDs skip reconciliation unless either syncing
-  flag is true, in which case startup performs a full local-to-remote sync. An
+  flag or the previous local active marker is true. In those cases startup
+  performs a full local-to-remote sync to recover an interrupted upload or
+  session, including changes queued before any batch started. An
   incomplete local generation one ahead of remote is recovered this way too. A
   completed local generation ahead of remote is an error. Before each outgoing
   batch, generation is incremented, a fresh sync ID is written locally then
@@ -111,12 +113,23 @@ State file behavior:
   after the entire batch succeeds, so failures remain detectable on the next
   run. A required remote-to-local sync deletes local payload absent remotely.
 
+  The local-only active marker is set true at startup and stays true across
+  interval batches. It is cleared only after the watcher drains and all pending
+  changes sync successfully at shutdown, even if the wrapped command exits
+  nonzero. Failed recovery, final sync, or watching leaves it true. Remote state
+  is never written with this marker. Newer remote generations and conflicting
+  sync IDs retain remote-to-local reconciliation priority after a broken session.
+
   Legacy state without sync IDs remains readable. Incomplete states at equal
   generations without IDs on either side require manual reconciliation because
   the upload identity is ambiguous. Completed legacy states gain IDs on upload.
+  A missing active marker means inactive; completed legacy states can recover
+  an active session. Older readers may reject local state containing active.
 
   State paths inside either payload root are excluded from payload transfers.
   When local and remote paths differ, both relative names are reserved.
+  Local updates use synced temporary files and atomic rename. Sibling names
+  matching <local-state-file>.rcw-tmp-* are reserved and excluded as well.
 
 Shutdown and retries:
   Failed running syncs retry with exponential backoff from 1 second to 1
