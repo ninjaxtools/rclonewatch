@@ -247,8 +247,8 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 }
 
 func (s *syncState) validateAcquisition(local syncFileData, localExists bool, remote remoteSyncFile) error {
-	if s.failOnIncomplete && ((localExists && (local.Syncing || local.Active)) || (remote.exists && remote.data.Syncing)) {
-		return errors.New("state file indicates an incomplete previous sync")
+	if s.failOnIncomplete && remote.exists && remote.data.Syncing && needsSyncFromRemote(local, localExists, remote.data) {
+		return errors.New("remote state indicates an incomplete sync requiring remote-to-local reconciliation")
 	}
 	if !remote.exists && !s.forceDeleteUntrackedRemote {
 		empty, err := s.remotePayloadEmpty()
@@ -264,6 +264,14 @@ func (s *syncState) validateAcquisition(local syncFileData, localExists bool, re
 		return fmt.Errorf("local generation %d is ahead of remote generation %d", local.Generation, remote.data.Generation)
 	}
 	return nil
+}
+
+func needsSyncFromRemote(local syncFileData, localExists bool, remote syncFileData) bool {
+	if remote.Generation == 0 {
+		return false
+	}
+	return !localExists || local.Generation < remote.Generation ||
+		(local.Generation == remote.Generation && local.SyncID != remote.SyncID)
 }
 
 func (s *syncState) verifyAcquiredLock(deadline time.Time, interrupt <-chan os.Signal) (remoteSyncFile, error) {
@@ -346,7 +354,7 @@ func (s *syncState) InitializeGeneration() error {
 	// An unpublished local advance can collide with another writer's generation.
 	// Only matching sync IDs establish that equal generations describe the same upload.
 	differentSync := local.Generation == remote.data.Generation && local.SyncID != remote.data.SyncID
-	if !localExists || local.Generation < remote.data.Generation || differentSync {
+	if needsSyncFromRemote(local, localExists, remote.data) {
 		if s.logs {
 			switch {
 			case !localExists:

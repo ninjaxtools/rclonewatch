@@ -61,9 +61,9 @@ Options:
         Cannot be used with --upload-only.
 
   --fail-on-incomplete-sync
-        Exit with status 1 before lock acquisition or remote writes when the
-        local or remote .rcw-state has syncing set to true, or local active is
-        true from an interrupted session. Cannot be used with --upload-only.
+        Exit with status 1 before lock acquisition or remote writes when remote
+        .rcw-state has syncing set to true and startup would fully sync remote
+        to local. Cannot be used with --upload-only.
 
   --state-file PATH
         Use PATH, relative to each root and including the filename, for both

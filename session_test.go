@@ -151,16 +151,23 @@ func TestActiveSessionRecoveryFailureRemainsActive(t *testing.T) {
 	assertSyncState(t, state.paths.local, 5, true, false)
 }
 
-func TestFailOnIncompleteRejectsActiveSession(t *testing.T) {
+func TestFailOnIncompleteAllowsActiveSessionRecovery(t *testing.T) {
 	runner := &memorySyncRunner{}
 	runner.setData(syncFileData{Generation: 4, SyncID: "same"})
 	state, source := newMemoryState(t, runner, time.Hour, lockWait{}, false, true)
 	writeSyncState(t, state.paths.local, syncFileData{Generation: 4, SyncID: "same", Active: true})
-	if err := state.Acquire(make(chan os.Signal)); err == nil || !strings.Contains(err.Error(), "incomplete") {
-		t.Fatalf("Acquire error = %v, want incomplete-session rejection", err)
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
 	}
-	if got := runner.writes(); got != 0 {
-		t.Fatalf("remote writes = %d, want 0", got)
+	state.Start()
+	if err := state.InitializeGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.payloadRan {
+		t.Fatal("interrupted session did not trigger recovery sync")
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
 	}
 	assertLocalActive(t, source, true)
 }

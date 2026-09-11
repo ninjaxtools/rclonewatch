@@ -695,22 +695,73 @@ func TestSyncStateConditionalWrites(t *testing.T) {
 }
 
 func TestFailOnIncompleteBeforeRemoteWrite(t *testing.T) {
-	for _, location := range []string{"local", "remote"} {
-		t.Run(location, func(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		local       *syncFileData
+		remote      syncFileData
+		wantFailure bool
+	}{
+		{
+			name:        "remote generation ahead",
+			local:       &syncFileData{Generation: 1, SyncID: "old"},
+			remote:      syncFileData{Generation: 2, SyncID: "new", Syncing: true},
+			wantFailure: true,
+		},
+		{
+			name:        "local state absent",
+			remote:      syncFileData{Generation: 2, SyncID: "new", Syncing: true},
+			wantFailure: true,
+		},
+		{
+			name:        "conflicting sync IDs",
+			local:       &syncFileData{Generation: 2, SyncID: "local"},
+			remote:      syncFileData{Generation: 2, SyncID: "remote", Syncing: true},
+			wantFailure: true,
+		},
+		{
+			name:   "matching remote incomplete",
+			local:  &syncFileData{Generation: 2, SyncID: "same"},
+			remote: syncFileData{Generation: 2, SyncID: "same", Syncing: true},
+		},
+		{
+			name:   "matching local incomplete",
+			local:  &syncFileData{Generation: 2, SyncID: "same", Syncing: true},
+			remote: syncFileData{Generation: 2, SyncID: "same"},
+		},
+		{
+			name:   "interrupted local session",
+			local:  &syncFileData{Generation: 2, SyncID: "same", Active: true},
+			remote: syncFileData{Generation: 2, SyncID: "same"},
+		},
+		{
+			name:   "completed remote generation ahead",
+			local:  &syncFileData{Generation: 1, SyncID: "old"},
+			remote: syncFileData{Generation: 2, SyncID: "new"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			runner := &memorySyncRunner{}
-			runner.setData(syncFileData{Generation: 1, Syncing: location == "remote"})
+			runner.setData(test.remote)
 			state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, true)
-			if location == "local" {
-				if err := writeLocalSyncFile(state.paths.local, syncFileData{Generation: 1, Syncing: true}); err != nil {
-					t.Fatal(err)
-				}
+			if test.local != nil {
+				writeSyncState(t, state.paths.local, *test.local)
 			}
 			err := state.Acquire(make(chan os.Signal))
-			if err == nil || !strings.Contains(err.Error(), "incomplete previous sync") {
-				t.Fatalf("Acquire error = %v, want incomplete-sync error", err)
+			if test.wantFailure {
+				if err == nil || !strings.Contains(err.Error(), "incomplete sync requiring remote-to-local") {
+					t.Fatalf("Acquire error = %v, want incomplete remote-sync error", err)
+				}
+				if got := runner.writes(); got != 0 {
+					t.Fatalf("remote writes = %d, want 0", got)
+				}
+				return
 			}
-			if got := runner.writes(); got != 0 {
-				t.Fatalf("remote writes = %d, want 0", got)
+			if err != nil {
+				t.Fatalf("Acquire error = %v, want success", err)
+			}
+			state.Start()
+			if err := state.Close(); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}

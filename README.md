@@ -62,7 +62,7 @@ Arguments:
 - `--exclude GLOB` excludes files matching an [rclone filter glob](https://rclone.org/filtering/). Repeat the option to supply multiple patterns. Patterns apply to outgoing payload syncs and startup reconciliation, not sync-state metadata.
 - `--no-consistent-writes` disables conditional state writes for direct S3-compatible destinations. S3 conditional writes are enabled by default and require rclone v1.73.0 or newer.
 - `--force-delete-untracked-remote` permits initialization when the destination has no `.rcw-state` file but is not empty. Existing remote payload is deleted before the initial local-to-remote sync.
-- `--fail-on-incomplete-sync` exits with status `1`, before lock acquisition or any remote write, if local or remote state records `"syncing": true`, or local state records `"active": true` from an interrupted session.
+- `--fail-on-incomplete-sync` exits with status `1`, before lock acquisition or any remote write, when remote state records `"syncing": true` and startup would perform a full remote-to-local sync because local state is absent, behind, or has a conflicting sync ID.
 - `--state-file PATH` changes the state-file path on both sides. The path includes the filename and is resolved relative to each payload root. Glob characters in state paths are treated literally. Line breaks are rejected because rclone's single-file metadata reads and filters do not handle them consistently.
 - `--state-file-local PATH` and `--state-file-remote PATH` set different paths and must be supplied together. They cannot be combined with `--state-file`.
 - `--logs` writes rclonewatch diagnostics, sync status, changed paths, and rclone output to stdout. Without it, rclonewatch does not write any runtime output itself.
@@ -109,7 +109,7 @@ By default, startup initializes untracked destinations and reconciles generation
 - Equal initialized generations with matching sync IDs skip reconciliation only when neither state file records `syncing: true` and the previous local `active` marker is false. If either syncing flag or the previous active marker is true, startup performs a full local-to-remote sync. This recovers changes queued during an interrupted session even if no upload batch had started.
 - A completed local generation higher than an initialized remote is an error. A one-generation local advance marked incomplete is an unpublished metadata update and is recovered with a full local-to-remote sync as well.
 - Recovery uploads advance the generation and clear both syncing flags only after success; local `active` remains true until successful shutdown. If local state is absent, its generation is behind the remote, or equal generations have different sync IDs, the full remote-to-local sync takes priority even when either syncing flag or the local active marker is set. The remote's generation, sync ID, and syncing value are copied to local state, which is marked active for the new session.
-- With `--fail-on-incomplete-sync`, startup refuses incomplete uploads and interrupted local sessions before modifying the remote.
+- With `--fail-on-incomplete-sync`, startup refuses to import an incomplete remote state when remote-to-local reconciliation would otherwise be required. Local-to-remote recovery of an interrupted upload or local session is unaffected.
 
 Local state updates use a synced temporary file, atomic rename, and directory sync. Temporary sibling files matching `<local-state-file>.rcw-tmp-*` are reserved and excluded from payload transfers and change batching. When local state is initially absent, it is created with `active: true` after initialization or download succeeds; until then, absent local state or remote generation `0` ensures that interrupted startup work is retried.
 
@@ -117,7 +117,7 @@ Older state files without `sync_id` remain readable and gain an ID on the next u
 
 Local state without `active` is treated as inactive for compatibility. Completed legacy generations without sync IDs can recover an interrupted session using `active: true`; the ambiguous-incomplete-upload check still applies if either `syncing` flag is true. The active marker is never written to remote state. Older versions that reject unknown fields cannot read updated local state files containing it.
 
-**Warning:** Files are not necessarily synced to the remote in the order they were written locally. If a program writes multiple files and a later write assumes that an earlier one has already been persisted, an interrupted sync may leave the remote in an inconsistent state.
+**Warning:** Files are not necessarily synced to the remote in the order they were written locally. If a program writes multiple files and a later write assumes that an earlier one has already been persisted, an interrupted sync may leave the remote in an inconsistent state. Use `--fail-on-incomplete-sync` to stop before rclonewatch fully syncs that incomplete remote state to local, allowing it to be inspected and reconciled first.
 
 ## Releasing
 

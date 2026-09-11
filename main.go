@@ -570,7 +570,7 @@ func parseConfig(args []string) (config, error) {
 	flags.BoolVar(&cfg.logs, "logs", false, "log sync activity and rclone output to stdout")
 	flags.BoolVar(&cfg.uploadOnly, "upload-only", false, "only upload local changes without using sync state or a remote lock")
 	flags.BoolVar(&cfg.forceDeleteRemote, "force-delete-untracked-remote", false, "delete and initialize a non-empty destination without a state file")
-	flags.BoolVar(&cfg.failOnIncomplete, "fail-on-incomplete-sync", false, "exit if state records an incomplete upload or interrupted local session")
+	flags.BoolVar(&cfg.failOnIncomplete, "fail-on-incomplete-sync", false, "exit before reconciling an incomplete remote sync to local")
 	flags.BoolVar(&cfg.noConsistentWrites, "no-consistent-writes", false, "disable conditional lock writes for S3-compatible destinations")
 	flags.StringVar(&cfg.stateFile, "state-file", "", "state file path relative to both source and destination")
 	flags.StringVar(&cfg.stateFileLocal, "state-file-local", "", "state file path relative to the local source")
