@@ -98,7 +98,10 @@ State file behavior:
   be empty unless --force-delete-untracked-remote is supplied. Initialization
   locks remote generation 0, clears its payload, fully syncs local to remote, then
   promotes both state files to generation 1. If local state is absent or older,
-  startup performs a full remote-to-local sync. Equal generations skip it. A
+  startup performs a full remote-to-local sync, even if syncing is true. Equal
+  generations skip reconciliation unless either syncing flag is true, in which
+  case startup performs a full local-to-remote sync to recover the upload. An
+  incomplete local generation one ahead of remote is recovered this way too. A
   completed local generation ahead of remote is an error. Before each outgoing
   batch, generation is incremented and syncing is set true on both sides before
   payload changes. It is cleared only after the entire batch succeeds, so

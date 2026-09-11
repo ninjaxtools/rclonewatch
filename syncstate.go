@@ -333,17 +333,21 @@ func (s *syncState) InitializeGeneration() error {
 		}
 		return writeLocalSyncFile(s.paths.local, syncFileData{Generation: remote.data.Generation, Syncing: remote.data.Syncing})
 	}
-	if local.Generation > remote.data.Generation {
-		if local.Syncing && local.Generation == remote.data.Generation+1 {
-			if s.logs {
-				s.logger.Printf("discarding unpublished local generation %d", local.Generation)
-			}
-			return writeLocalSyncFile(s.paths.local, syncFileData{Generation: remote.data.Generation, Syncing: remote.data.Syncing})
-		}
+	localIncompleteAdvance := local.Syncing && local.Generation == remote.data.Generation+1
+	if local.Generation > remote.data.Generation && !localIncompleteAdvance {
 		return fmt.Errorf("local generation %d is ahead of remote generation %d", local.Generation, remote.data.Generation)
 	}
-	if local.Syncing != remote.data.Syncing {
-		return writeLocalSyncFile(s.paths.local, syncFileData{Generation: remote.data.Generation, Syncing: remote.data.Syncing})
+	if local.Syncing || remote.data.Syncing {
+		if s.logs {
+			s.logger.Printf("previous sync is incomplete; syncing local to remote")
+		}
+		if err := s.BeforeRemoteChange(); err != nil {
+			return err
+		}
+		if err := s.syncToRemote(); err != nil {
+			return fmt.Errorf("recover incomplete local-to-remote sync: %w", err)
+		}
+		return s.AfterRemoteChange()
 	}
 	if s.logs {
 		s.logger.Printf("local and remote generation are current at %d", local.Generation)

@@ -770,7 +770,13 @@ func TestSyncStateRecoversUnpublishedLocalGeneration(t *testing.T) {
 	if err := state.InitializeGeneration(); err != nil {
 		t.Fatal(err)
 	}
-	assertSyncState(t, state.paths.local, 4, false, false)
+	assertSyncState(t, state.paths.local, 5, false, false)
+	if !runner.payloadRan {
+		t.Fatal("unpublished generation did not trigger recovery sync")
+	}
+	if remote := runner.data(t); remote.Generation != 5 || remote.Syncing {
+		t.Fatalf("remote state after recovery = %#v", remote)
+	}
 	state.Start()
 	if err := state.Close(); err != nil {
 		t.Fatal(err)
@@ -842,6 +848,102 @@ func TestSyncStateRetainsIncompleteFlagAfterPayloadFailure(t *testing.T) {
 	remote := runner.data(t)
 	if remote.Generation != 2 || !remote.Syncing || remote.Lock != nil {
 		t.Fatalf("remote state after failed payload and release = %#v", remote)
+	}
+}
+
+func TestSyncStateRetriesFailedRecovery(t *testing.T) {
+	runner := &memorySyncRunner{requireGeneration: 5, requireSyncing: true}
+	runner.setData(syncFileData{Generation: 4, Syncing: true})
+	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
+	writeSyncState(t, state.paths.local, syncFileData{Generation: 4, Syncing: true})
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	state.Start()
+	t.Cleanup(func() {
+		if err := state.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	failure := errors.New("recovery payload failed")
+	runner.payloadErr = failure
+	if err := state.InitializeGeneration(); !errors.Is(err, failure) {
+		t.Fatalf("recovery error = %v, want %v", err, failure)
+	}
+	assertSyncState(t, state.paths.local, 5, true, false)
+	if remote := runner.data(t); remote.Generation != 5 || !remote.Syncing || remote.Lock == nil {
+		t.Fatalf("remote state after failed recovery = %#v", remote)
+	}
+	runner.payloadErr = nil
+	runner.requireGeneration = 6
+	if err := state.InitializeGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	assertSyncState(t, state.paths.local, 6, false, false)
+	if remote := runner.data(t); remote.Generation != 6 || remote.Syncing || remote.Lock == nil {
+		t.Fatalf("remote state after recovery retry = %#v", remote)
+	}
+}
+
+func TestSyncStateRecoversIncompleteSyncWithLocalRclone(t *testing.T) {
+	requireRclone(t)
+	for _, test := range []struct {
+		name        string
+		local       syncFileData
+		remote      syncFileData
+		localAbsent bool
+		fromRemote  bool
+	}{
+		{name: "both incomplete", local: syncFileData{Generation: 4, Syncing: true}, remote: syncFileData{Generation: 4, Syncing: true}},
+		{name: "local incomplete", local: syncFileData{Generation: 4, Syncing: true}, remote: syncFileData{Generation: 4}},
+		{name: "remote incomplete", local: syncFileData{Generation: 4}, remote: syncFileData{Generation: 4, Syncing: true}},
+		{name: "unpublished generation", local: syncFileData{Generation: 5, Syncing: true}, remote: syncFileData{Generation: 4}},
+		{name: "remote ahead local incomplete", local: syncFileData{Generation: 3, Syncing: true}, remote: syncFileData{Generation: 4}, fromRemote: true},
+		{name: "remote ahead remote incomplete", local: syncFileData{Generation: 3}, remote: syncFileData{Generation: 4, Syncing: true}, fromRemote: true},
+		{name: "remote ahead both incomplete", local: syncFileData{Generation: 3, Syncing: true}, remote: syncFileData{Generation: 4, Syncing: true}, fromRemote: true},
+		{name: "local absent remote incomplete", localAbsent: true, remote: syncFileData{Generation: 4, Syncing: true}, fromRemote: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			source := t.TempDir()
+			destination := t.TempDir()
+			if !test.localAbsent {
+				writeSyncState(t, filepath.Join(source, defaultStateFile), test.local)
+			}
+			writeSyncState(t, filepath.Join(destination, defaultStateFile), test.remote)
+			writeTestFile(t, filepath.Join(source, "payload.txt"), "local payload")
+			writeTestFile(t, filepath.Join(destination, "payload.txt"), "remote payload")
+			writeTestFile(t, filepath.Join(source, "local-only.txt"), "local")
+			writeTestFile(t, filepath.Join(destination, "remote-only.txt"), "remote")
+			state := acquireLocalState(t, source, destination)
+			state.Start()
+			t.Cleanup(func() {
+				if err := state.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			if err := state.InitializeGeneration(); err != nil {
+				t.Fatal(err)
+			}
+			wantPayload, retained, removed := "local payload", "local-only.txt", "remote-only.txt"
+			generation, syncing := test.remote.Generation+1, false
+			if test.fromRemote {
+				wantPayload, retained, removed = "remote payload", "remote-only.txt", "local-only.txt"
+				generation, syncing = test.remote.Generation, test.remote.Syncing
+			}
+			for _, root := range []string{source, destination} {
+				if got := readTestFile(t, filepath.Join(root, "payload.txt")); got != wantPayload {
+					t.Fatalf("payload in %s = %q, want %q", root, got, wantPayload)
+				}
+				if _, err := os.Stat(filepath.Join(root, retained)); err != nil {
+					t.Fatalf("retained file in %s: %v", root, err)
+				}
+				if _, err := os.Stat(filepath.Join(root, removed)); !os.IsNotExist(err) {
+					t.Fatalf("removed file in %s still exists: %v", root, err)
+				}
+			}
+			assertSyncState(t, state.paths.local, generation, syncing, false)
+			assertSyncState(t, state.paths.remote, generation, syncing, true)
+		})
 	}
 }
 

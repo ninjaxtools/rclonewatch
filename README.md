@@ -91,9 +91,10 @@ By default, startup initializes untracked destinations and reconciles generation
 - If remote state is absent, an empty destination is locked at generation `0`, cleared, fully synced from local to remote, and promoted to generation `1`. A non-empty destination is rejected unless `--force-delete-untracked-remote` is supplied.
 - A remote generation `0` records an interrupted initialization. After acquiring its lock, startup clears the remote payload, retries the full local-to-remote sync, and promotes both state files to generation `1`.
 - If only the remote state file exists or its generation is higher, the remote is fully synced to the local source.
-- Equal initialized generations skip reconciliation.
-- A completed local generation higher than an initialized remote is an error. A one-generation local advance marked incomplete is an unpublished metadata update and is rolled back safely.
-- Without `--fail-on-incomplete-sync`, an old `syncing` value is retained until a successful payload sync supersedes or completes it. With the option, startup refuses incomplete local or remote state before modifying the remote.
+- Equal initialized generations skip reconciliation only when neither state file records `syncing: true`. If either does, startup performs a full local-to-remote sync to recover the incomplete upload.
+- A completed local generation higher than an initialized remote is an error. A one-generation local advance marked incomplete is an unpublished metadata update and is recovered with a full local-to-remote sync as well.
+- Recovery uploads advance the generation and clear both syncing flags only after success. If local state is absent or its generation is behind the remote, the full remote-to-local sync takes priority even when either syncing flag is set; the remote's syncing value is copied to local state.
+- With `--fail-on-incomplete-sync`, startup refuses incomplete local or remote state before modifying the remote.
 
 **Warning:** Files are not necessarily synced to the remote in the order they were written locally. If a program writes multiple files and a later write assumes that an earlier one has already been persisted, an interrupted sync may leave the remote in an inconsistent state.
 
