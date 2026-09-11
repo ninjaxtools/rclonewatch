@@ -80,9 +80,10 @@ Direct S3 remotes use conditional `If-None-Match` and `If-Match` writes by defau
 
 ## State and reconciliation
 
-`.rcw-state` combines generation and synchronization status with the optional lock:
+`.rcw-state` combines generation, sync identity, and synchronization status with the optional lock:
 
 - `generation` is a positive integer starting at `1`; remote generation `0` is reserved for an initialization in progress and is never written locally.
+- `sync_id` is a unique, randomly generated identifier for an upload attempt. Initialization creates one, and each outgoing batch (including recovery) creates a new one, written locally before publication remotely. It is retained after completion and through lock refreshes and release.
 - `syncing` is set to `true` locally and remotely, together with an incremented generation, before each outgoing payload batch. It returns to `false` only after every payload operation succeeds.
 - `lock`, while held, contains an opaque owner token (or the supplied persistent ID), an RFC3339Nano timestamp, and the writer's TTL. Unlocking removes this field while preserving the rest of the state.
 
@@ -91,10 +92,13 @@ By default, startup initializes untracked destinations and reconciles generation
 - If remote state is absent, an empty destination is locked at generation `0`, cleared, fully synced from local to remote, and promoted to generation `1`. A non-empty destination is rejected unless `--force-delete-untracked-remote` is supplied.
 - A remote generation `0` records an interrupted initialization. After acquiring its lock, startup clears the remote payload, retries the full local-to-remote sync, and promotes both state files to generation `1`.
 - If only the remote state file exists or its generation is higher, the remote is fully synced to the local source.
-- Equal initialized generations skip reconciliation only when neither state file records `syncing: true`. If either does, startup performs a full local-to-remote sync to recover the incomplete upload.
+- Equal initialized generations with different sync IDs trigger a full remote-to-local sync. This prevents an unpublished local generation from overwriting another writer's upload that happens to have the same generation number.
+- Equal initialized generations with matching sync IDs skip reconciliation only when neither state file records `syncing: true`. If either does, startup performs a full local-to-remote sync to recover the incomplete upload.
 - A completed local generation higher than an initialized remote is an error. A one-generation local advance marked incomplete is an unpublished metadata update and is recovered with a full local-to-remote sync as well.
-- Recovery uploads advance the generation and clear both syncing flags only after success. If local state is absent or its generation is behind the remote, the full remote-to-local sync takes priority even when either syncing flag is set; the remote's syncing value is copied to local state.
+- Recovery uploads advance the generation and clear both syncing flags only after success. If local state is absent, its generation is behind the remote, or equal generations have different sync IDs, the full remote-to-local sync takes priority even when either syncing flag is set; the remote's generation, sync ID, and syncing value are copied to local state.
 - With `--fail-on-incomplete-sync`, startup refuses incomplete local or remote state before modifying the remote.
+
+Older state files without `sync_id` remain readable and gain an ID on the next upload. Equal generations with no IDs on either side can skip reconciliation when both are complete, but incomplete states are ambiguous and require manual reconciliation. If only one side has an ID at equal generations, the IDs differ and remote-to-local reconciliation applies. All writers must support the new state field; older versions that reject unknown fields cannot read it.
 
 **Warning:** Files are not necessarily synced to the remote in the order they were written locally. If a program writes multiple files and a later write assumes that an earlier one has already been persisted, an interrupted sync may leave the remote in an inconsistent state.
 

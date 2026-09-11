@@ -92,21 +92,28 @@ Wrapped command:
 
 State file behavior:
   By default, rclonewatch coordinates writers and reconciles remote changes
-  through .rcw-state. It combines the persistent generation, incomplete-sync
-  flag, and optional lock owner, timestamp, and TTL. Unlocking clears the lock
-  fields but does not delete the file. A destination without remote state must
-  be empty unless --force-delete-untracked-remote is supplied. Initialization
-  locks remote generation 0, clears its payload, fully syncs local to remote, then
-  promotes both state files to generation 1. If local state is absent or older,
-  startup performs a full remote-to-local sync, even if syncing is true. Equal
-  generations skip reconciliation unless either syncing flag is true, in which
-  case startup performs a full local-to-remote sync to recover the upload. An
+  through .rcw-state. It combines the persistent generation, unique sync_id,
+  incomplete-sync flag, and optional lock owner, timestamp, and TTL. Unlocking
+  clears the lock fields but does not delete the file. A destination without
+  remote state must be empty unless --force-delete-untracked-remote is supplied.
+  Initialization locks remote generation 0, clears its payload, fully syncs
+  local to remote, then promotes both state files to generation 1. If local state
+  is absent or older, startup performs a full remote-to-local sync, even if
+  syncing is true. Equal generations with different sync IDs also trigger a
+  remote-to-local sync.
+  Matching generations and sync IDs skip reconciliation unless either syncing
+  flag is true, in which case startup performs a full local-to-remote sync. An
   incomplete local generation one ahead of remote is recovered this way too. A
   completed local generation ahead of remote is an error. Before each outgoing
-  batch, generation is incremented and syncing is set true on both sides before
-  payload changes. It is cleared only after the entire batch succeeds, so
-  failures remain detectable on the next run. A required remote-to-local sync
-  deletes local payload absent remotely.
+  batch, generation is incremented, a fresh sync ID is written locally then
+  remotely, and syncing is set true on both sides before payload changes.
+  The sync ID is retained after completion. The syncing flag is cleared only
+  after the entire batch succeeds, so failures remain detectable on the next
+  run. A required remote-to-local sync deletes local payload absent remotely.
+
+  Legacy state without sync IDs remains readable. Incomplete states at equal
+  generations without IDs on either side require manual reconciliation because
+  the upload identity is ambiguous. Completed legacy states gain IDs on upload.
 
   State paths inside either payload root are excluded from payload transfers.
   When local and remote paths differ, both relative names are reserved.

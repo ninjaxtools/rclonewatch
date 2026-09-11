@@ -25,6 +25,7 @@ const lockPollInterval = time.Second
 
 type syncFileData struct {
 	Generation uint64        `json:"generation"`
+	SyncID     string        `json:"sync_id,omitempty"`
 	Syncing    bool          `json:"syncing"`
 	Lock       *syncFileLock `json:"lock,omitempty"`
 }
@@ -235,7 +236,7 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 			}
 			return writeErr
 		}
-		if !current.ownedBy(s.owner) || current.data.Generation != candidate.Generation || current.data.Syncing != candidate.Syncing {
+		if !current.ownedBy(s.owner) || current.data.Generation != candidate.Generation || current.data.SyncID != candidate.SyncID || current.data.Syncing != candidate.Syncing {
 			if canWait && current.data.Lock != nil {
 				if defaultWait && observedLock != "" && current.lockIdentity() != observedLock {
 					return errors.New("remote lock was refreshed while waiting")
@@ -293,11 +294,12 @@ func (s *syncState) InitializeRemote() error {
 	remote = s.getRemote()
 	candidate := remote.data
 	candidate.Generation = 1
+	candidate.SyncID = rand.Text()
 	candidate.Syncing = false
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("complete remote initialization: %w", err)
 	}
-	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: 1}); err != nil {
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: 1, SyncID: candidate.SyncID}); err != nil {
 		return fmt.Errorf("write initial local state: %w", err)
 	}
 	if s.logs {
@@ -315,29 +317,33 @@ func (s *syncState) InitializeGeneration() error {
 		return err
 	}
 	remote := s.getRemote()
-	if !localExists {
+	// An unpublished local advance can collide with another writer's generation.
+	// Only matching sync IDs establish that equal generations describe the same upload.
+	differentSync := local.Generation == remote.data.Generation && local.SyncID != remote.data.SyncID
+	if !localExists || local.Generation < remote.data.Generation || differentSync {
 		if s.logs {
-			s.logger.Printf("local sync state is absent; syncing remote to local")
+			switch {
+			case !localExists:
+				s.logger.Printf("local sync state is absent; syncing remote to local")
+			case differentSync:
+				s.logger.Printf("generation %d has a different sync ID; syncing remote to local", remote.data.Generation)
+			default:
+				s.logger.Printf("remote generation %d is newer; syncing remote to local", remote.data.Generation)
+			}
 		}
 		if err := s.syncFromRemote(); err != nil {
 			return err
 		}
-		return writeLocalSyncFile(s.paths.local, syncFileData{Generation: remote.data.Generation, Syncing: remote.data.Syncing})
-	}
-	if local.Generation < remote.data.Generation {
-		if s.logs {
-			s.logger.Printf("remote generation %d is newer; syncing remote to local", remote.data.Generation)
-		}
-		if err := s.syncFromRemote(); err != nil {
-			return err
-		}
-		return writeLocalSyncFile(s.paths.local, syncFileData{Generation: remote.data.Generation, Syncing: remote.data.Syncing})
+		return writeLocalSyncFile(s.paths.local, syncFileData{Generation: remote.data.Generation, SyncID: remote.data.SyncID, Syncing: remote.data.Syncing})
 	}
 	localIncompleteAdvance := local.Syncing && local.Generation == remote.data.Generation+1
 	if local.Generation > remote.data.Generation && !localIncompleteAdvance {
 		return fmt.Errorf("local generation %d is ahead of remote generation %d", local.Generation, remote.data.Generation)
 	}
 	if local.Syncing || remote.data.Syncing {
+		if local.Generation == remote.data.Generation && local.SyncID == "" {
+			return errors.New("cannot recover incomplete sync at equal generations without sync IDs; reconcile local and remote payloads manually")
+		}
 		if s.logs {
 			s.logger.Printf("previous sync is incomplete; syncing local to remote")
 		}
@@ -366,11 +372,13 @@ func (s *syncState) BeforeRemoteChange() error {
 		return errors.New("generation number cannot be incremented")
 	}
 	next := remote.data.Generation + 1
-	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: next, Syncing: true}); err != nil {
+	syncID := rand.Text()
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: next, SyncID: syncID, Syncing: true}); err != nil {
 		return fmt.Errorf("increment local generation: %w", err)
 	}
 	candidate := remote.data
 	candidate.Generation = next
+	candidate.SyncID = syncID
 	candidate.Syncing = true
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("publish generation %d: %w", next, err)
@@ -390,7 +398,7 @@ func (s *syncState) AfterRemoteChange() error {
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("clear remote syncing flag: %w", err)
 	}
-	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: candidate.Generation}); err != nil {
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: candidate.Generation, SyncID: candidate.SyncID}); err != nil {
 		return fmt.Errorf("clear local syncing flag: %w", err)
 	}
 	if s.logs {
@@ -778,7 +786,7 @@ func sameLock(left, right *syncFileLock) bool {
 }
 
 func sameSyncFileData(left, right syncFileData) bool {
-	return left.Generation == right.Generation && left.Syncing == right.Syncing && sameLock(left.Lock, right.Lock)
+	return left.Generation == right.Generation && left.SyncID == right.SyncID && left.Syncing == right.Syncing && sameLock(left.Lock, right.Lock)
 }
 
 func readLocalSyncFile(path string) (syncFileData, bool, error) {

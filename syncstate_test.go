@@ -28,8 +28,10 @@ type memorySyncRunner struct {
 	ambiguousFailures   int
 	payloadErr          error
 	payloadRan          bool
+	payloadSyncID       string
 	requireGeneration   uint64
 	requireSyncing      bool
+	requireLocalState   string
 	remoteFiles         bool
 }
 
@@ -97,7 +99,14 @@ func (r *memorySyncRunner) Run(args []string, stdout, stderr io.Writer) error {
 		if r.requireSyncing && !data.Syncing {
 			return errors.New("payload command ran without syncing flag")
 		}
+		if r.requireLocalState != "" {
+			local, exists, err := readLocalSyncFile(r.requireLocalState)
+			if err != nil || !exists || data.SyncID == "" || local.SyncID != data.SyncID || local.Generation != data.Generation || !local.Syncing {
+				return fmt.Errorf("payload command observed inconsistent local state: %#v, remote: %#v, error: %v", local, data, err)
+			}
+		}
 		r.payloadRan = true
+		r.payloadSyncID = data.SyncID
 		return r.payloadErr
 	}
 }
@@ -218,7 +227,7 @@ func TestSyncStateLifecycleWithLocalRclone(t *testing.T) {
 
 func TestSyncStateRetriesLockRefresh(t *testing.T) {
 	runner := &memorySyncRunner{}
-	runner.setData(syncFileData{Generation: 1})
+	runner.setData(syncFileData{Generation: 1, SyncID: "retained"})
 	state, _ := newMemoryState(t, runner, 200*time.Millisecond, lockWait{}, false, false)
 	state.pollInterval = 10 * time.Millisecond
 	if err := state.Acquire(make(chan os.Signal)); err != nil {
@@ -242,6 +251,9 @@ func TestSyncStateRetriesLockRefresh(t *testing.T) {
 	}
 	if attempts := runner.attempts() - initialAttempts; attempts < 3 {
 		t.Fatalf("refresh attempts = %d, want at least 3", attempts)
+	}
+	if runner.data(t).SyncID != "retained" {
+		t.Fatal("lock refresh changed the sync ID")
 	}
 	if err := state.Close(); err != nil {
 		t.Fatal(err)
@@ -792,8 +804,14 @@ func TestSyncStateMarksPayloadTransition(t *testing.T) {
 	if err := state.InitializeGeneration(); err != nil {
 		t.Fatal(err)
 	}
+	initialID := runner.data(t).SyncID
+	if initialID == "" {
+		t.Fatal("initialization did not create a sync ID")
+	}
+	assertSyncID(t, state.paths.local, initialID)
 	runner.requireGeneration = 2
 	runner.requireSyncing = true
+	runner.requireLocalState = state.paths.local
 	runner.payloadRan = false
 	state.Start()
 	if err := os.WriteFile(filepath.Join(source, "payload.txt"), []byte("payload"), 0o600); err != nil {
@@ -818,8 +836,15 @@ func TestSyncStateMarksPayloadTransition(t *testing.T) {
 	if remote.Generation != 2 || remote.Syncing || remote.Lock == nil {
 		t.Fatalf("remote state after payload = %#v", remote)
 	}
+	if remote.SyncID == "" || remote.SyncID == initialID || remote.SyncID != runner.payloadSyncID {
+		t.Fatalf("sync ID after payload = %q, initial = %q, during payload = %q", remote.SyncID, initialID, runner.payloadSyncID)
+	}
+	assertSyncID(t, state.paths.local, remote.SyncID)
 	if err := state.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if runner.data(t).SyncID != remote.SyncID {
+		t.Fatal("lock release changed the sync ID")
 	}
 }
 
@@ -853,9 +878,10 @@ func TestSyncStateRetainsIncompleteFlagAfterPayloadFailure(t *testing.T) {
 
 func TestSyncStateRetriesFailedRecovery(t *testing.T) {
 	runner := &memorySyncRunner{requireGeneration: 5, requireSyncing: true}
-	runner.setData(syncFileData{Generation: 4, Syncing: true})
+	runner.setData(syncFileData{Generation: 4, SyncID: "interrupted", Syncing: true})
 	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
-	writeSyncState(t, state.paths.local, syncFileData{Generation: 4, Syncing: true})
+	writeSyncState(t, state.paths.local, syncFileData{Generation: 4, SyncID: "interrupted", Syncing: true})
+	runner.requireLocalState = state.paths.local
 	if err := state.Acquire(make(chan os.Signal)); err != nil {
 		t.Fatal(err)
 	}
@@ -874,6 +900,11 @@ func TestSyncStateRetriesFailedRecovery(t *testing.T) {
 	if remote := runner.data(t); remote.Generation != 5 || !remote.Syncing || remote.Lock == nil {
 		t.Fatalf("remote state after failed recovery = %#v", remote)
 	}
+	failedID := runner.data(t).SyncID
+	if failedID == "" || failedID == "interrupted" {
+		t.Fatalf("recovery did not create a fresh sync ID: %q", failedID)
+	}
+	assertSyncID(t, state.paths.local, failedID)
 	runner.payloadErr = nil
 	runner.requireGeneration = 6
 	if err := state.InitializeGeneration(); err != nil {
@@ -883,6 +914,10 @@ func TestSyncStateRetriesFailedRecovery(t *testing.T) {
 	if remote := runner.data(t); remote.Generation != 6 || remote.Syncing || remote.Lock == nil {
 		t.Fatalf("remote state after recovery retry = %#v", remote)
 	}
+	if remote := runner.data(t); remote.SyncID == failedID || remote.SyncID != runner.payloadSyncID {
+		t.Fatalf("retry did not retain a fresh sync ID: %#v", remote)
+	}
+	assertSyncID(t, state.paths.local, runner.data(t).SyncID)
 }
 
 func TestSyncStateRecoversIncompleteSyncWithLocalRclone(t *testing.T) {
@@ -894,14 +929,18 @@ func TestSyncStateRecoversIncompleteSyncWithLocalRclone(t *testing.T) {
 		localAbsent bool
 		fromRemote  bool
 	}{
-		{name: "both incomplete", local: syncFileData{Generation: 4, Syncing: true}, remote: syncFileData{Generation: 4, Syncing: true}},
-		{name: "local incomplete", local: syncFileData{Generation: 4, Syncing: true}, remote: syncFileData{Generation: 4}},
-		{name: "remote incomplete", local: syncFileData{Generation: 4}, remote: syncFileData{Generation: 4, Syncing: true}},
-		{name: "unpublished generation", local: syncFileData{Generation: 5, Syncing: true}, remote: syncFileData{Generation: 4}},
-		{name: "remote ahead local incomplete", local: syncFileData{Generation: 3, Syncing: true}, remote: syncFileData{Generation: 4}, fromRemote: true},
-		{name: "remote ahead remote incomplete", local: syncFileData{Generation: 3}, remote: syncFileData{Generation: 4, Syncing: true}, fromRemote: true},
-		{name: "remote ahead both incomplete", local: syncFileData{Generation: 3, Syncing: true}, remote: syncFileData{Generation: 4, Syncing: true}, fromRemote: true},
-		{name: "local absent remote incomplete", localAbsent: true, remote: syncFileData{Generation: 4, Syncing: true}, fromRemote: true},
+		{name: "both incomplete", local: syncFileData{Generation: 4, SyncID: "same", Syncing: true}, remote: syncFileData{Generation: 4, SyncID: "same", Syncing: true}},
+		{name: "local incomplete", local: syncFileData{Generation: 4, SyncID: "same", Syncing: true}, remote: syncFileData{Generation: 4, SyncID: "same"}},
+		{name: "remote incomplete", local: syncFileData{Generation: 4, SyncID: "same"}, remote: syncFileData{Generation: 4, SyncID: "same", Syncing: true}},
+		{name: "unpublished generation", local: syncFileData{Generation: 5, SyncID: "unpublished", Syncing: true}, remote: syncFileData{Generation: 4, SyncID: "previous"}},
+		{name: "remote ahead local incomplete", local: syncFileData{Generation: 3, SyncID: "old", Syncing: true}, remote: syncFileData{Generation: 4, SyncID: "new"}, fromRemote: true},
+		{name: "remote ahead remote incomplete", local: syncFileData{Generation: 3, SyncID: "old"}, remote: syncFileData{Generation: 4, SyncID: "new", Syncing: true}, fromRemote: true},
+		{name: "remote ahead both incomplete", local: syncFileData{Generation: 3, SyncID: "old", Syncing: true}, remote: syncFileData{Generation: 4, SyncID: "new", Syncing: true}, fromRemote: true},
+		{name: "local absent remote incomplete", localAbsent: true, remote: syncFileData{Generation: 4, SyncID: "new", Syncing: true}, fromRemote: true},
+		{name: "equal generation different IDs", local: syncFileData{Generation: 4, SyncID: "unpublished", Syncing: true}, remote: syncFileData{Generation: 4, SyncID: "other-writer"}, fromRemote: true},
+		{name: "equal completed generation different IDs", local: syncFileData{Generation: 4, SyncID: "different"}, remote: syncFileData{Generation: 4, SyncID: "other-writer"}, fromRemote: true},
+		{name: "legacy local incomplete", local: syncFileData{Generation: 4, Syncing: true}, remote: syncFileData{Generation: 4, SyncID: "other-writer"}, fromRemote: true},
+		{name: "legacy remote", local: syncFileData{Generation: 4, SyncID: "unpublished", Syncing: true}, remote: syncFileData{Generation: 4}, fromRemote: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			source := t.TempDir()
@@ -943,6 +982,18 @@ func TestSyncStateRecoversIncompleteSyncWithLocalRclone(t *testing.T) {
 			}
 			assertSyncState(t, state.paths.local, generation, syncing, false)
 			assertSyncState(t, state.paths.remote, generation, syncing, true)
+			remote, _, err := readLocalSyncFile(state.paths.remote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.fromRemote {
+				if remote.SyncID != test.remote.SyncID {
+					t.Fatalf("download changed remote sync ID: %q", remote.SyncID)
+				}
+			} else if remote.SyncID == "" || remote.SyncID == test.remote.SyncID || remote.SyncID == test.local.SyncID {
+				t.Fatalf("recovery did not publish a fresh sync ID: %q", remote.SyncID)
+			}
+			assertSyncID(t, state.paths.local, remote.SyncID)
 		})
 	}
 }
@@ -1197,6 +1248,14 @@ func assertSyncState(t *testing.T, path string, generation uint64, syncing, lock
 	}
 	if !exists || data.Generation != generation || data.Syncing != syncing || (data.Lock != nil) != locked {
 		t.Fatalf("sync state at %q = %#v (exists %v), want generation=%d syncing=%v locked=%v", path, data, exists, generation, syncing, locked)
+	}
+}
+
+func assertSyncID(t *testing.T, path, want string) {
+	t.Helper()
+	data, exists, err := readLocalSyncFile(path)
+	if err != nil || !exists || data.SyncID != want {
+		t.Fatalf("sync ID at %q = %q (exists %v, error %v), want %q", path, data.SyncID, exists, err, want)
 	}
 }
 
