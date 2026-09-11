@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -106,21 +105,22 @@ func (s *syncer) Sync(batch map[string]change) error {
 	}
 
 	paths := make([]string, 0, len(batch))
-	full := false
 	for path := range batch {
 		if s.state != nil {
-			exact, ancestor := s.state.protects(path)
+			exact, _ := s.state.protects(path)
 			if exact {
 				continue
 			}
-			full = full || ancestor
 		}
 		paths = append(paths, path)
+	}
+	paths, err := s.reconciliationScopes(paths)
+	if err != nil {
+		return err
 	}
 	if len(paths) == 0 {
 		return nil
 	}
-	sort.Strings(paths)
 
 	if s.logs {
 		s.logger.Printf("syncing %d changed path(s)", len(paths))
@@ -140,66 +140,12 @@ func (s *syncer) Sync(batch map[string]change) error {
 		return s.state.AfterRemoteChange()
 	}
 
-	_, requestedFull := batch["."]
-	if full || requestedFull || len(s.excludes) > 0 {
-		args := []string{"sync", s.source, s.dest, "--create-empty-src-dirs"}
-		if s.state != nil {
-			for _, filter := range s.state.payloadFilters() {
-				args = append(args, "--exclude", "/"+filter)
-			}
-		}
-		for _, pattern := range s.excludes {
-			args = append(args, "--exclude", pattern)
-		}
-		if err := s.run(args...); err != nil {
-			return fmt.Errorf("full sync: %w", err)
-		}
-		if err := complete(); err != nil {
+	if paths[0] == "." {
+		if err := s.fullSync(); err != nil {
 			return err
 		}
-		if s.logs {
-			s.logger.Printf("sync completed: %d changed path(s)", len(paths))
-		}
-		return nil
-	}
-
-	var existingFiles, existingDirs, deletedFiles, deletedDirs []string
-	for _, path := range paths {
-		item := batch[path]
-		info, err := os.Lstat(filepath.Join(s.source, filepath.FromSlash(path)))
-		switch {
-		case err == nil && info.IsDir():
-			existingDirs = append(existingDirs, path)
-		case err == nil:
-			existingFiles = append(existingFiles, path)
-		case errors.Is(err, os.ErrNotExist) && item.isDir:
-			deletedDirs = append(deletedDirs, path)
-		case errors.Is(err, os.ErrNotExist):
-			deletedFiles = append(deletedFiles, path)
-		default:
-			return fmt.Errorf("inspect %q: %w", path, err)
-		}
-	}
-
-	if len(existingFiles) > 0 {
-		if err := s.runWithList(existingFiles, "sync", s.source, s.dest, "--no-traverse", "--create-empty-src-dirs"); err != nil {
-			return fmt.Errorf("sync changed files: %w", err)
-		}
-	}
-	for _, path := range minimalDirs(existingDirs) {
-		if err := s.run("mkdir", remotePath(s.dest, path)); err != nil {
-			return fmt.Errorf("create directory %q: %w", path, err)
-		}
-	}
-	if len(deletedFiles) > 0 {
-		if err := s.runWithList(deletedFiles, "delete", s.dest); err != nil {
-			return fmt.Errorf("delete changed files: %w", err)
-		}
-	}
-	for _, path := range topLevelDirs(deletedDirs) {
-		if err := s.run("purge", remotePath(s.dest, path)); err != nil {
-			return fmt.Errorf("delete directory %q: %w", path, err)
-		}
+	} else if err := s.syncScopes(paths); err != nil {
+		return err
 	}
 	if err := complete(); err != nil {
 		return err
@@ -211,26 +157,15 @@ func (s *syncer) Sync(batch map[string]change) error {
 	return nil
 }
 
-func (s *syncer) runWithList(paths []string, args ...string) error {
-	file, err := os.CreateTemp("", "rclonewatch-*")
-	if err != nil {
-		return err
+func (s *syncer) fullSync() error {
+	var filters []string
+	if s.state != nil {
+		filters = s.state.payloadFilters()
 	}
-	name := file.Name()
-	defer os.Remove(name)
-
-	for _, path := range paths {
-		if _, err := file.WriteString(path + "\x00"); err != nil {
-			file.Close()
-			return err
-		}
+	if err := s.run(payloadSyncArgs(s.source, s.dest, filters, s.excludes)...); err != nil {
+		return fmt.Errorf("full sync: %w", err)
 	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-
-	args = append(args, "--files-from0", name)
-	return s.run(args...)
+	return nil
 }
 
 func (s *syncer) run(args ...string) error {
@@ -248,72 +183,20 @@ func remotePath(root, relative string) string {
 	return strings.TrimRight(root, "/") + "/" + relative
 }
 
-func minimalDirs(paths []string) []string {
-	// Creating a leaf directory also creates its missing parents.
-	sort.Slice(paths, func(i, j int) bool {
-		return len(paths[i]) > len(paths[j])
-	})
-	result := make([]string, 0, len(paths))
-	for _, path := range paths {
-		covered := false
-		for _, existing := range result {
-			if strings.HasPrefix(existing, path+"/") {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			result = append(result, path)
-		}
-	}
-	return result
-}
-
-func topLevelDirs(paths []string) []string {
-	sort.Slice(paths, func(i, j int) bool {
-		return len(paths[i]) < len(paths[j])
-	})
-	result := make([]string, 0, len(paths))
-	for _, path := range paths {
-		covered := false
-		for _, existing := range result {
-			if strings.HasPrefix(path, existing+"/") {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			result = append(result, path)
-		}
-	}
-	return result
-}
-
 type syncResult struct {
 	batch map[string]change
 	err   error
 }
 
 func addPending(pending map[string]change, item change) {
-	previous, exists := pending[item.path]
-	if exists && previous.removed && !item.removed && previous.isDir != item.isDir {
-		// Filtered rclone operations cannot safely replace a file with a
-		// directory (or the reverse), so reconcile the complete tree.
-		pending["."] = change{path: ".", isDir: true}
-	}
 	pending[item.path] = item
 }
 
 func mergeFailedBatch(pending, failed map[string]change) {
 	for path, item := range failed {
-		newer, exists := pending[path]
-		if exists {
-			if item.removed && !newer.removed && item.isDir != newer.isDir {
-				pending["."] = change{path: ".", isDir: true}
-			}
-			continue
+		if _, exists := pending[path]; !exists {
+			pending[path] = item
 		}
-		pending[path] = item
 	}
 }
 
@@ -340,6 +223,43 @@ func signalCommandGroup(cmd *exec.Cmd, signal os.Signal) error {
 		return cmd.Process.Signal(signal)
 	}
 	return syscall.Kill(-cmd.Process.Pid, sig)
+}
+
+// Drain events while startup reconciliation runs, so large downloads cannot
+// block the watcher and writes made during the startup scan remain pending.
+func initializeWatching(state *syncState, watcher *watcher, pending map[string]change) error {
+	done := make(chan error, 1)
+	go func() { done <- state.InitializeGeneration() }()
+	eventC, errorC := watcher.Events(), watcher.Errors()
+	var watcherErr error
+	for {
+		select {
+		case item, ok := <-eventC:
+			if !ok {
+				eventC = nil
+				continue
+			}
+			if exact, _ := state.protects(item.path); !exact {
+				addPending(pending, item)
+			}
+		case err, ok := <-errorC:
+			if !ok {
+				errorC = nil
+				continue
+			}
+			if err != nil && watcherErr == nil {
+				watcherErr = err
+				if state.cancelCommands != nil {
+					state.cancelCommands()
+				}
+			}
+		case err := <-done:
+			if watcherErr != nil {
+				return fmt.Errorf("watch during initialization: %w", watcherErr)
+			}
+			return err
+		}
+	}
 }
 
 func run(cfg config) (exitCode int) {
@@ -386,8 +306,19 @@ func run(cfg config) (exitCode int) {
 		}()
 	}
 
+	watcher, err := newWatcher(cfg.source)
+	if err != nil {
+		logger.Printf("%v", err)
+		return 1
+	}
+	defer func() {
+		watcher.Close()
+		for range watcher.Events() {
+		}
+	}()
+	pending := make(map[string]change)
 	if state != nil {
-		if err := state.InitializeGeneration(); err != nil {
+		if err := initializeWatching(state, watcher, pending); err != nil {
 			logger.Printf("initialize generation: %v", err)
 			return 1
 		}
@@ -401,12 +332,6 @@ func run(cfg config) (exitCode int) {
 			}
 		default:
 		}
-	}
-
-	watcher, err := newWatcher(cfg.source)
-	if err != nil {
-		logger.Printf("%v", err)
-		return 1
 	}
 
 	s := &syncer{
@@ -442,7 +367,6 @@ func run(cfg config) (exitCode int) {
 		logger.Printf("watching %q for changes", cfg.source)
 	}
 
-	pending := make(map[string]change)
 	results := make(chan syncResult, 1)
 	var timer *time.Timer
 	var timerC <-chan time.Time
@@ -726,6 +650,10 @@ func parseConfig(args []string) (config, error) {
 	}
 	if !info.IsDir() {
 		return config{}, fmt.Errorf("source folder %q is not a directory", source)
+	}
+	source, err = filepath.EvalSymlinks(source)
+	if err != nil {
+		return config{}, fmt.Errorf("resolve source folder: %w", err)
 	}
 	cfg.source = source
 	cfg.dest = flags.Arg(1)

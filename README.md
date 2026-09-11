@@ -52,7 +52,7 @@ For other S3-compatible services, set the provider and endpoint described in [rc
 
 Arguments:
 
-- `SOURCE_FOLDER` is an existing local directory.
+- `SOURCE_FOLDER` is an existing local directory. A symlink root is resolved before watching and resolving local state paths.
 - `RCLONE_DESTINATION` is any destination accepted by rclone.
 - `--interval DURATION` waits that long after each successful sync before starting another. Failed syncs retry with exponential backoff from 1 second to 1 minute. With no interval, changes are synced only during shutdown.
 - `--lock-ttl DURATION` overrides the default two-minute remote lock expiry. The TTL is stored with the lock, whose timestamp is refreshed at half the TTL.
@@ -63,12 +63,22 @@ Arguments:
 - `--no-consistent-writes` disables conditional state writes for direct S3-compatible destinations. S3 conditional writes are enabled by default and require rclone v1.73.0 or newer.
 - `--force-delete-untracked-remote` permits initialization when the destination has no `.rcw-state` file but is not empty. Existing remote payload is deleted before the initial local-to-remote sync.
 - `--fail-on-incomplete-sync` exits with status `1`, before lock acquisition or any remote write, if local or remote state records `"syncing": true`, or local state records `"active": true` from an interrupted session.
-- `--state-file PATH` changes the state-file path on both sides. The path includes the filename and is resolved relative to each payload root.
+- `--state-file PATH` changes the state-file path on both sides. The path includes the filename and is resolved relative to each payload root. Glob characters in state paths are treated literally. Line breaks are rejected because rclone's single-file metadata reads and filters do not handle them consistently.
 - `--state-file-local PATH` and `--state-file-remote PATH` set different paths and must be supplied together. They cannot be combined with `--state-file`.
 - `--logs` writes rclonewatch diagnostics, sync status, changed paths, and rclone output to stdout. Without it, rclonewatch does not write any runtime output itself.
 - `-- COMMAND [ARG...]` runs a command after inotify is ready with standard input, output, and error passed through unchanged. `rclonewatch` watches until it exits, then performs the final sync and returns the command's status when syncing succeeds. `SIGINT` and `SIGTERM` are forwarded to the command, and `rclonewatch` waits for it to exit.
 
 Send `SIGINT` or `SIGTERM` to stop watching, finish one final sync, and exit. With a wrapped command, its status is returned when syncing succeeds. A failed final sync, lock/generation failure, or watcher failure exits with status `1`; invalid command-line usage exits with status `2`.
+
+## Watching and payload synchronization
+
+Watches are installed before startup reconciliation. Events are collected while initialization or download runs and retained for the next outgoing batch, including writes made after the startup scan has passed a file. Inotify queue overflow rebuilds the recursive watch set and requests a full reconciliation, so newly created or moved directories continue to be watched afterward.
+
+File and directory changes are coalesced into the smallest set of affected paths and subtrees. For example, events for `a`, `a/b`, and `a/b/file` reconcile `a` once. A scoped sync transfers included files and removes obsolete contents within those scopes, preserving unrelated sibling payload. Deletions and uploads are grouped separately so an already-absent child does not cause a remote ancestor file to be replaced. Deleting an already absent directory succeeds, including when it was never uploaded or was removed by an earlier attempt.
+
+Scopes use root-relative rclone filters, so anchored user exclusions and state-file protections retain their meaning. Obsolete entries are deleted before copying to allow file/directory replacements. If a queued child's parent has disappeared or become a file, reconciliation expands to that affected ancestor. A conflicting remote ancestor file can also be replaced without syncing its unrelated siblings. Excluded payload and metadata remain protected; a type conflict requiring their deletion fails the sync. Failed batches retain their scopes for retry rather than automatically expanding to a full-root sync.
+
+Full-root synchronization is used for initialization, startup reconciliation, interrupted-session recovery, and explicit rescans such as inotify overflow. Paths whose names cannot be safely expressed in a filter use the nearest representable ancestor, which may be the root. Known-changed files and reconciliation transfers use `--ignore-times`: matching size and modification time cannot hide changed contents, including on backends without usable checksums. Scoped reconciliation retransfers included files only within its selected subtrees; full-root reconciliation retransfers all included files.
 
 ## Locking
 
@@ -78,6 +88,8 @@ Lock expiry is always measured locally by waiting the stored TTL from the time a
 
 Direct S3 remotes use conditional `If-None-Match` and `If-Match` writes by default. Other backends, and S3 providers used with `--no-consistent-writes`, use advisory write/read ownership verification; all writers must follow the same protocol.
 
+Backend detection uses the configured backend type, including environment-defined and on-the-fly remotes and connection-string overrides. It does not depend on the remote's name. Acquisition rechecks incomplete-state and untracked-payload conditions after waiting or losing an acquisition race, before writing a new lock.
+
 ## State and reconciliation
 
 `.rcw-state` combines generation, sync identity, and synchronization status with the optional lock:
@@ -85,7 +97,7 @@ Direct S3 remotes use conditional `If-None-Match` and `If-Match` writes by defau
 - `generation` is a positive integer starting at `1`; remote generation `0` is reserved for an initialization in progress and is never written locally.
 - `sync_id` is a unique, randomly generated identifier for an upload attempt. Initialization creates one, and each outgoing batch (including recovery) creates a new one, written locally before publication remotely. It is retained after completion and through lock refreshes and release.
 - `syncing` is set to `true` locally and remotely, together with an incremented generation, before each outgoing payload batch. It returns to `false` only after every payload operation succeeds.
-- `active` is a local-only session marker. Startup sets it to `true` before watching or running a wrapped command, and it stays true through successful interval batches. Shutdown sets it to `false` only after the watcher has drained and all pending changes have synced successfully. A wrapped command's nonzero exit status does not prevent clearing it when syncing succeeds. Failed recovery, failed final sync, and watcher failures leave it true.
+- `active` is a local-only session marker. Startup sets it to `true` before running a wrapped command, and it stays true through successful interval batches. Shutdown sets it to `false` only after the watcher has drained and all pending changes have synced successfully. A wrapped command's nonzero exit status does not prevent clearing it when syncing succeeds. Failed recovery, failed final sync, and watcher failures leave it true.
 - `lock`, while held, contains an opaque owner token (or the supplied persistent ID), an RFC3339Nano timestamp, and the writer's TTL. Unlocking removes this field while preserving the rest of the state.
 
 By default, startup initializes untracked destinations and reconciles generations as follows:

@@ -64,9 +64,25 @@ func TestResolveStateFilePaths(t *testing.T) {
 }
 
 func TestResolveStateFilePathsRejectsInvalidNames(t *testing.T) {
-	for _, paths := range [][2]string{{"", "state"}, {"state", ""}, {"/absolute", "state"}, {"state", "/absolute"}, {".", "state"}, {"state", "."}} {
+	for _, paths := range [][2]string{{"", "state"}, {"state", ""}, {"/absolute", "state"}, {"state", "/absolute"}, {".", "state"}, {"state", "."}, {"state\nfile", "state"}, {"state", "state\rfile"}} {
 		if _, err := resolveSyncFilePaths(t.TempDir(), "remote:root", paths[0], paths[1]); err == nil {
 			t.Fatalf("paths %#v were accepted", paths)
+		}
+	}
+}
+
+func TestStatePathsWithQuotedConnectionOptions(t *testing.T) {
+	for _, root := range []string{
+		`:s3,endpoint='http://localhost:9000',provider=Minio:bucket/root`,
+		`remote,description='it''s: a test',type="s3":bucket/root`,
+	} {
+		paths, err := resolveSyncFilePaths(t.TempDir(), root, "state", "../state")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := root[:len(root)-len("root")] + "state"
+		if paths.remote != want || paths.remoteFilter != "" {
+			t.Fatalf("resolved quoted remote = %q (filter %q), want %q", paths.remote, paths.remoteFilter, want)
 		}
 	}
 }

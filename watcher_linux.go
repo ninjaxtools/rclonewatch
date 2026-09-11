@@ -44,13 +44,13 @@ type watcher struct {
 }
 
 func newWatcher(root string) (*watcher, error) {
-	fd, err := syscall.InotifyInit1(syscall.IN_CLOEXEC | syscall.IN_NONBLOCK)
+	root, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return nil, fmt.Errorf("initialize inotify: %w", err)
+		return nil, fmt.Errorf("resolve watch root: %w", err)
 	}
 	w := &watcher{
 		root:         root,
-		fd:           fd,
+		fd:           -1,
 		events:       make(chan change, 4096),
 		errors:       make(chan error, 1),
 		stop:         make(chan struct{}),
@@ -58,12 +58,36 @@ func newWatcher(root string) (*watcher, error) {
 		byDescriptor: make(map[int]string),
 		byPath:       make(map[string]int),
 	}
-	if err := w.addTree(root, false); err != nil {
-		syscall.Close(fd)
+	if err := w.rebuild(); err != nil {
 		return nil, err
 	}
 	go w.readLoop()
 	return w, nil
+}
+
+// Use a new inotify instance so stale queued events and reused descriptors from
+// the old tree cannot corrupt the rebuilt watch mappings. The following full
+// sync covers changes made before their new watches were installed.
+func (w *watcher) rebuild() error {
+	fd, err := syscall.InotifyInit1(syscall.IN_CLOEXEC | syscall.IN_NONBLOCK)
+	if err != nil {
+		return fmt.Errorf("initialize inotify: %w", err)
+	}
+	replacement := &watcher{root: w.root, fd: fd, byDescriptor: make(map[int]string), byPath: make(map[string]int)}
+	if err := replacement.addTree(w.root, false); err != nil {
+		syscall.Close(fd)
+		return err
+	}
+	if _, exists := replacement.byPath[w.root]; !exists {
+		syscall.Close(fd)
+		return errors.New("source folder is no longer a directory")
+	}
+	oldFD := w.fd
+	w.fd, w.byDescriptor, w.byPath = fd, replacement.byDescriptor, replacement.byPath
+	if oldFD >= 0 {
+		syscall.Close(oldFD)
+	}
+	return nil
 }
 
 func (w *watcher) Events() <-chan change { return w.events }
@@ -142,7 +166,7 @@ func (w *watcher) readLoop() {
 	defer close(w.done)
 	defer close(w.events)
 	defer close(w.errors)
-	defer syscall.Close(w.fd)
+	defer func() { syscall.Close(w.fd) }()
 
 	buffer := make([]byte, 64*1024)
 	// unsafe.Sizeof includes tail padding for InotifyEvent.Name on newer Go
@@ -176,7 +200,12 @@ func (w *watcher) readLoop() {
 				return
 			}
 			name := string(bytes.TrimRight(buffer[offset+headerSize:offset+size], "\x00"))
+			fd := w.fd
 			w.handle(int(event.Wd), event.Mask, name)
+			if w.fd != fd {
+				// Everything remaining in this buffer belongs to the old watches.
+				break
+			}
 			offset += size
 		}
 	}
@@ -184,7 +213,11 @@ func (w *watcher) readLoop() {
 
 func (w *watcher) handle(descriptor int, mask uint32, name string) {
 	if mask&syscall.IN_Q_OVERFLOW != 0 {
-		// A complete sync restores correctness after events were lost.
+		if err := w.rebuild(); err != nil {
+			w.fail(fmt.Errorf("rebuild watches after overflow: %w", err))
+			w.Close()
+			return
+		}
 		w.send(change{path: ".", isDir: true})
 		return
 	}

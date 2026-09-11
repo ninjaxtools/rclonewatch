@@ -68,6 +68,7 @@ Options:
   --state-file PATH
         Use PATH, relative to each root and including the filename, for both
         local and remote sync state. Cannot be combined with the path pair.
+        Glob characters are literal; paths containing line breaks are rejected.
 
   --state-file-local PATH
   --state-file-remote PATH
@@ -89,6 +90,20 @@ Wrapped command:
   then drains events, performs a final sync, and returns the command's status
   if syncing succeeds. SIGINT and SIGTERM are forwarded to the command, whose
   exit is awaited before final shutdown.
+
+Watching and payload transfers:
+  A symlink source root is resolved before watching. Watches are installed before
+  startup reconciliation, and changes are collected throughout that work.
+  Inotify overflow rebuilds recursive watches and requests a full sync.
+  Changed paths and subtrees are reconciled using root-relative scope filters;
+  overlapping scopes are collapsed, and unrelated sibling payload is preserved.
+  Directory deletion is idempotent. Missing or replaced parents expand a scope
+  only to the affected ancestor. Syncs delete before copying to resolve type
+  conflicts; excluded payload and metadata remain protected. Failed scopes are
+  retained for retry. Full-root syncs are used for startup reconciliation,
+  recovery, and explicit rescans. Unrepresentable names use the nearest safe
+  ancestor scope. Transfers use --ignore-times so matching size/mtime cannot hide
+  changed content; only files included within the selected scopes are recopied.
 
 State file behavior:
   By default, rclonewatch coordinates writers and reconciles remote changes

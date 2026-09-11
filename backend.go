@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -12,23 +12,49 @@ func useConsistentWrites(destination string, disabled bool, runner commandRunner
 	if disabled {
 		return false, nil
 	}
-	var stdout, stderr bytes.Buffer
-	if err := runner.Run([]string{"backend", "features", destination}, &stdout, &stderr); err != nil {
-		return false, fmt.Errorf("detect destination backend: %w", commandError(err, stderr.String()))
+	backend, err := destinationBackend(destination, runner)
+	if err != nil {
+		return false, err
 	}
-	var backend struct {
-		Name string
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &backend); err != nil {
-		return false, fmt.Errorf("decode destination backend features: %w", err)
-	}
-	if backend.Name != "s3" {
+	if backend != "s3" {
 		return false, nil
 	}
 	if err := requireConditionalWriteVersion(runner); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func destinationBackend(destination string, runner commandRunner) (string, error) {
+	remote, err := parseRemote(destination)
+	if err != nil {
+		return "", err
+	}
+	if remote.colon < 0 {
+		return "local", nil
+	}
+	if strings.HasPrefix(remote.name, ":") {
+		return strings.TrimPrefix(remote.name, ":"), nil
+	}
+	if backend, ok := remote.options["type"]; ok {
+		return backend, nil
+	}
+	if backend, ok := os.LookupEnv("RCLONE_CONFIG_" + strings.ToUpper(remote.name) + "_TYPE"); ok {
+		return backend, nil
+	}
+	var stdout, stderr bytes.Buffer
+	// Unlike backend features.Name, listremotes reports the backend type.
+	// --long also works with older rclone versions used for non-S3 remotes.
+	if err := runner.Run([]string{"listremotes", "--long"}, &stdout, &stderr); err != nil {
+		return "", fmt.Errorf("detect destination backend: %w", commandError(err, stderr.String()))
+	}
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		name, rest, found := strings.Cut(line, ":")
+		if fields := strings.Fields(rest); found && name == remote.name && len(fields) > 0 {
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("cannot determine backend type for remote %q", remote.name)
 }
 
 func requireConditionalWriteVersion(runner commandRunner) error {

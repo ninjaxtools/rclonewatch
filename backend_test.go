@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"testing"
 )
 
@@ -12,11 +13,45 @@ type backendRunner struct {
 	calls   int
 }
 
+func TestBackendDetectionWithRclone(t *testing.T) {
+	requireRclone(t)
+	config := filepath.Join(t.TempDir(), "rclone.conf")
+	writeTestFile(t, config, "[backup]\ntype = s3\nprovider = AWS\n[s3]\ntype = local\n[space name]\ntype = s3\n")
+	t.Setenv("RCLONE_CONFIG", config)
+	t.Setenv("RCLONE_CONFIG_ENVBACKUP_TYPE", "s3")
+	t.Setenv("RCLONE_CONFIG_OVERRIDDEN_TYPE", "local")
+	for _, test := range []struct {
+		destination string
+		want        bool
+	}{
+		{"backup:bucket/path", true},
+		{"space name:bucket/path", true},
+		{"envbackup:bucket/path", true},
+		{"ENVBACKUP:bucket/path", true},
+		{"s3:path", false},
+		{"backup,type=local:path", false},
+		{"s3,type='s3':bucket/path", true},
+		{"overridden:path", false},
+		{":s3:bucket/path", true},
+		{`:s3,endpoint='http://localhost:9000',provider=Minio:bucket/path`, true},
+		{`backup,provider='Other',endpoint="http://localhost:9000":bucket/path`, true},
+		{t.TempDir(), false},
+		{"local,backup", false},
+	} {
+		t.Run(test.destination, func(t *testing.T) {
+			got, err := useConsistentWrites(test.destination, false, &rcloneCommand{})
+			if err != nil || got != test.want {
+				t.Fatalf("consistent writes = %v, error %v, want %v", got, err, test.want)
+			}
+		})
+	}
+}
+
 func (r *backendRunner) Run(args []string, stdout, _ io.Writer) error {
 	r.calls++
 	switch args[0] {
-	case "backend":
-		_, err := fmt.Fprintf(stdout, `{"Name":%q}`, r.name)
+	case "listremotes":
+		_, err := fmt.Fprintf(stdout, "remote: %s\n", r.name)
 		return err
 	case "version":
 		_, err := fmt.Fprintf(stdout, "rclone %s\n", r.version)

@@ -116,21 +116,8 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 	if err != nil {
 		return err
 	}
-	if s.failOnIncomplete && ((localExists && (local.Syncing || local.Active)) || (remote.exists && remote.data.Syncing)) {
-		return errors.New("state file indicates an incomplete previous sync")
-	}
-	if !remote.exists && !s.forceDeleteUntrackedRemote {
-		empty, err := s.remotePayloadEmpty()
-		if err != nil {
-			return fmt.Errorf("inspect untracked remote destination: %w", err)
-		}
-		if !empty {
-			return errors.New("remote destination has no state file and is not empty; use --force-delete-untracked-remote to delete its contents and initialize it")
-		}
-	}
-	localIncompleteAdvance := localExists && remote.exists && local.Syncing && local.Generation == remote.data.Generation+1
-	if remote.exists && remote.data.Generation > 0 && localExists && local.Generation > remote.data.Generation && !localIncompleteAdvance {
-		return fmt.Errorf("local generation %d is ahead of remote generation %d", local.Generation, remote.data.Generation)
+	if err := s.validateAcquisition(local, localExists, remote); err != nil {
+		return err
 	}
 	if s.persistent && remote.ownedBy(s.owner) {
 		candidate := remote.data
@@ -197,6 +184,11 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 			}
 		}
 
+		// Revalidate the state observed after waiting or losing an acquisition
+		// race, before making any remote write based on it.
+		if err := s.validateAcquisition(local, localExists, remote); err != nil {
+			return err
+		}
 		candidate := remote.data
 		candidate.Lock = s.newLock()
 		writtenAt := time.Now()
@@ -252,6 +244,26 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 		}
 		return errLockOwnershipLost
 	}
+}
+
+func (s *syncState) validateAcquisition(local syncFileData, localExists bool, remote remoteSyncFile) error {
+	if s.failOnIncomplete && ((localExists && (local.Syncing || local.Active)) || (remote.exists && remote.data.Syncing)) {
+		return errors.New("state file indicates an incomplete previous sync")
+	}
+	if !remote.exists && !s.forceDeleteUntrackedRemote {
+		empty, err := s.remotePayloadEmpty()
+		if err != nil {
+			return fmt.Errorf("inspect untracked remote destination: %w", err)
+		}
+		if !empty {
+			return errors.New("remote destination has no state file and is not empty; use --force-delete-untracked-remote to delete its contents and initialize it")
+		}
+	}
+	localIncompleteAdvance := localExists && remote.exists && local.Syncing && local.Generation == remote.data.Generation+1
+	if remote.exists && remote.data.Generation > 0 && localExists && local.Generation > remote.data.Generation && !localIncompleteAdvance {
+		return fmt.Errorf("local generation %d is ahead of remote generation %d", local.Generation, remote.data.Generation)
+	}
+	return nil
 }
 
 func (s *syncState) verifyAcquiredLock(deadline time.Time, interrupt <-chan os.Signal) (remoteSyncFile, error) {
@@ -635,33 +647,30 @@ func (s *syncState) replaceOwnedRemote(previous remoteSyncFile, candidate syncFi
 }
 
 func (s *syncState) syncFromRemote() error {
-	args := []string{"sync", s.dest, s.source, "--create-empty-src-dirs"}
-	for _, filter := range s.payloadFilters() {
-		args = append(args, "--exclude", "/"+filter)
-	}
-	for _, pattern := range s.excludes {
-		args = append(args, "--exclude", pattern)
-	}
-	return s.run(args...)
+	return s.run(payloadSyncArgs(s.dest, s.source, s.payloadFilters(), s.excludes)...)
 }
 
 func (s *syncState) syncToRemote() error {
-	args := []string{"sync", s.source, s.dest, "--create-empty-src-dirs"}
-	for _, filter := range s.payloadFilters() {
-		args = append(args, "--exclude", "/"+filter)
-	}
-	for _, pattern := range s.excludes {
-		args = append(args, "--exclude", pattern)
-	}
-	return s.run(args...)
+	return s.run(payloadSyncArgs(s.source, s.dest, s.payloadFilters(), s.excludes)...)
 }
 
 func (s *syncState) deleteRemotePayload() error {
-	args := []string{"delete", s.dest, "--rmdirs"}
+	args := []string{"delete", s.dest}
 	if s.paths.remoteFilter != "" {
-		args = append(args, "--exclude", "/"+s.paths.remoteFilter)
+		args = append(args, "--exclude", "/"+literalFilterPath(s.paths.remoteFilter))
 	}
-	return s.run(args...)
+	if err := s.run(args...); err != nil {
+		if isRcloneNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	// Inspect directories without filtering out the state file; otherwise
+	// rclone can mistake its parent for an empty directory and fail to remove it.
+	if err := s.run("rmdirs", s.dest, "--leave-root"); err != nil && !isRcloneNotFound(err) {
+		return err
+	}
+	return nil
 }
 
 func (s *syncState) remotePayloadEmpty() (bool, error) {
@@ -682,11 +691,11 @@ func (s *syncState) remotePayloadEmpty() (bool, error) {
 func (s *syncState) payloadFilters() []string {
 	filters := make([]string, 0, 3)
 	if s.paths.localFilter != "" {
-		filters = append(filters, s.paths.localFilter+localStateTempPrefix+"*")
-		filters = append(filters, s.paths.localFilter)
+		filters = append(filters, literalFilterPath(s.paths.localFilter+localStateTempPrefix)+"*")
+		filters = append(filters, literalFilterPath(s.paths.localFilter))
 	}
 	if s.paths.remoteFilter != "" && s.paths.remoteFilter != s.paths.localFilter {
-		filters = append(filters, s.paths.remoteFilter)
+		filters = append(filters, literalFilterPath(s.paths.remoteFilter))
 	}
 	return filters
 }
@@ -695,7 +704,10 @@ func (s *syncState) protects(path string) (exact, ancestor bool) {
 	if s.paths.localFilter != "" && strings.HasPrefix(path, s.paths.localFilter+localStateTempPrefix) {
 		return true, false
 	}
-	for _, filter := range s.payloadFilters() {
+	for _, filter := range []string{s.paths.localFilter, s.paths.remoteFilter} {
+		if filter == "" {
+			continue
+		}
 		if path == filter {
 			return true, false
 		}

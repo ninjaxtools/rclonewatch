@@ -29,6 +29,9 @@ func resolveSyncFilePaths(source, destination, localRelative, remoteRelative str
 }
 
 func resolveLocalSyncFile(root, relative string) (string, string, error) {
+	if strings.ContainsAny(relative, "\r\n") {
+		return "", "", errors.New("state file paths must not contain line breaks")
+	}
 	if relative == "" || filepath.IsAbs(relative) {
 		return "", "", errors.New("local state file path must be a non-empty relative path")
 	}
@@ -44,10 +47,17 @@ func resolveLocalSyncFile(root, relative string) (string, string, error) {
 }
 
 func resolveRemoteSyncFile(root, relative string) (string, string, error) {
+	if strings.ContainsAny(relative, "\r\n") {
+		return "", "", errors.New("state file paths must not contain line breaks")
+	}
 	if relative == "" || path.IsAbs(relative) {
 		return "", "", errors.New("remote state file path must be a non-empty relative path")
 	}
-	colon := remoteColon(root)
+	remote, err := parseRemote(root)
+	if err != nil {
+		return "", "", err
+	}
+	colon := remote.colon
 	if colon < 0 {
 		resolved := filepath.Clean(filepath.Join(root, filepath.FromSlash(relative)))
 		if resolved == filepath.Clean(root) {
@@ -86,17 +96,75 @@ func relativeSlashPath(root, target string) string {
 	return filepath.ToSlash(relative)
 }
 
-func remoteColon(value string) int {
+type remoteSpec struct {
+	name    string
+	options map[string]string
+	colon   int
+}
+
+// Connection strings may contain quoted colons, commas, and slashes. Doubled
+// quotes represent a literal quote, as in rclone's connection-string syntax.
+func parseRemote(value string) (remoteSpec, error) {
+	remote := remoteSpec{colon: -1}
+	if !strings.Contains(value, ":") {
+		return remote, nil
+	}
+	start := 0
 	if strings.HasPrefix(value, ":") {
-		if next := strings.Index(value[1:], ":"); next >= 0 {
-			return next + 1
+		start = 1
+	}
+	end := strings.IndexAny(value[start:], ":,/\\")
+	if end < 0 {
+		return remote, nil
+	}
+	end += start
+	if value[end] == '/' || value[end] == '\\' {
+		return remote, nil
+	}
+	remote.name = value[:end]
+	remote.options = make(map[string]string)
+	for value[end] == ',' {
+		end++
+		keyStart := end
+		for end < len(value) && value[end] != '=' && value[end] != ',' && value[end] != ':' {
+			end++
 		}
-		return -1
+		if end == keyStart || end == len(value) {
+			return remote, errors.New("invalid remote connection-string option")
+		}
+		key, option := value[keyStart:end], "true"
+		if value[end] == '=' {
+			end++
+			var text strings.Builder
+			if end < len(value) && (value[end] == '\'' || value[end] == '"') {
+				quote := value[end]
+				end++
+				for {
+					if end == len(value) {
+						return remote, errors.New("unterminated remote connection-string quote")
+					}
+					if value[end] == quote {
+						end++
+						if end == len(value) || value[end] != quote {
+							break
+						}
+					}
+					text.WriteByte(value[end])
+					end++
+				}
+			} else {
+				for end < len(value) && value[end] != ',' && value[end] != ':' {
+					text.WriteByte(value[end])
+					end++
+				}
+			}
+			option = text.String()
+		}
+		remote.options[key] = option
+		if end == len(value) || (value[end] != ',' && value[end] != ':') {
+			return remote, errors.New("remote connection string needs a trailing colon")
+		}
 	}
-	colon := strings.Index(value, ":")
-	slash := strings.IndexAny(value, `/\\`)
-	if colon >= 0 && (slash < 0 || colon < slash) {
-		return colon
-	}
-	return -1
+	remote.colon = end
+	return remote, nil
 }

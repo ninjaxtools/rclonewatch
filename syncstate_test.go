@@ -1014,7 +1014,7 @@ func TestSyncFromRemoteAppliesExcludes(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"sync", "remote:destination", "/source", "--create-empty-src-dirs",
+		"sync", "remote:destination", "/source", "--create-empty-src-dirs", "--delete-before", "--ignore-times",
 		"--exclude", "/.local-state.rcw-tmp-*",
 		"--exclude", "/.local-state", "--exclude", "/.remote-state",
 		"--exclude", "*.tmp", "--exclude", "/cache/**",

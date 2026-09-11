@@ -196,12 +196,13 @@ func TestLegacyLocalStateStartsInactive(t *testing.T) {
 func TestFailedFinalSyncRetainsActiveSession(t *testing.T) {
 	requireRclone(t)
 	source, destination := t.TempDir(), t.TempDir()
-	process := startTestProcess(t, "--logs", source, destination)
+	process := startTestProcess(t, "--logs", "--exclude", "*.keep", source, destination)
 	t.Cleanup(func() { _ = process.cmd.Process.Kill() })
-	// A conflicting destination directory makes this payload copy fail.
+	// A type conflict containing excluded data cannot be safely replaced.
 	if err := os.Mkdir(filepath.Join(destination, "blocked"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	writeTestFile(t, filepath.Join(destination, "blocked", "protected.keep"), "protected")
 	writeTestFile(t, filepath.Join(source, "blocked"), "payload")
 	if err := process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)

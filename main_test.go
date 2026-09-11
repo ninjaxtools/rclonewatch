@@ -18,8 +18,8 @@ import (
 )
 
 type recordedCommand struct {
-	args []string
-	list []string
+	args  []string
+	rules []string
 }
 
 type recordingRunner struct {
@@ -29,30 +29,28 @@ type recordingRunner struct {
 func (r *recordingRunner) Run(args []string, _, _ io.Writer) error {
 	record := recordedCommand{args: append([]string(nil), args...)}
 	for index, arg := range args {
-		if arg != "--files-from0" || index+1 >= len(args) {
+		if arg != "--filter-from" || index+1 >= len(args) {
 			continue
 		}
 		contents, err := os.ReadFile(args[index+1])
 		if err != nil {
 			return err
 		}
-		for _, path := range strings.Split(strings.TrimSuffix(string(contents), "\x00"), "\x00") {
-			record.list = append(record.list, path)
-		}
+		record.rules = strings.Split(strings.TrimSuffix(string(contents), "\n"), "\n")
 	}
 	r.commands = append(r.commands, record)
 	return nil
 }
 
-func TestRunWithListSupportsNewlines(t *testing.T) {
+func TestScopedFiltersCannotInjectRules(t *testing.T) {
 	runner := &recordingRunner{}
 	s := syncer{runner: runner}
-	path := "directory/file\nwith-newline"
-	if err := s.runWithList([]string{path}, "sync", "source", "destination"); err != nil {
+	if err := s.syncScopeGroup([]string{"directory/file\n- **"}, true); err != nil {
 		t.Fatal(err)
 	}
-	if got := runner.commands[0].list; !reflect.DeepEqual(got, []string{path}) {
-		t.Fatalf("files-from0 list = %#v, want %#v", got, []string{path})
+	want := []string{`+ /directory/file␊-\x20\x2a\x2a`, `+ /directory/file␊-\x20\x2a\x2a/**`, "+ /directory", "- /**"}
+	if got := runner.commands[0].rules; !reflect.DeepEqual(got, want) {
+		t.Fatalf("scope rules = %#v, want %#v", got, want)
 	}
 }
 
@@ -84,23 +82,20 @@ func TestSyncerBuildsCommandsForChanges(t *testing.T) {
 	if err := s.Sync(batch); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.commands) != 4 {
-		t.Fatalf("got %d commands, want 4: %#v", len(runner.commands), runner.commands)
+	if len(runner.commands) != 2 {
+		t.Fatalf("got %d commands, want scoped deletion and upload: %#v", len(runner.commands), runner.commands)
 	}
-	if got, want := runner.commands[0].args[:3], []string{"sync", source, "remote:backup"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("sync command = %#v, want prefix %#v", got, want)
+	wantRules := [][]string{
+		{"+ /deleted\\x20directory", "+ /deleted\\x20directory/**", "+ /deleted\\x20file", "+ /deleted\\x20file/**", "- /**"},
+		{"+ /changed\\x20file", "+ /changed\\x20file/**", "+ /empty", "+ /empty/**", "- /**"},
 	}
-	if got, want := runner.commands[0].list, []string{"changed file"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("sync list = %#v, want %#v", got, want)
-	}
-	if got, want := runner.commands[1].args, []string{"mkdir", "remote:backup/empty/child"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("mkdir command = %#v, want %#v", got, want)
-	}
-	if got, want := runner.commands[2].list, []string{"deleted file"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("delete list = %#v, want %#v", got, want)
-	}
-	if got, want := runner.commands[3].args, []string{"purge", "remote:backup/deleted directory"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("purge command = %#v, want %#v", got, want)
+	for i, command := range runner.commands {
+		if got, want := command.args[:3], []string{"sync", source, "remote:backup"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("sync command = %#v, want prefix %#v", got, want)
+		}
+		if !reflect.DeepEqual(command.rules, wantRules[i]) {
+			t.Fatalf("scoped reconciliation = %#v, want %#v", command.rules, wantRules[i])
+		}
 	}
 }
 
@@ -238,12 +233,12 @@ func TestRemotePath(t *testing.T) {
 	}
 }
 
-func TestAddPendingRequestsFullSyncForTypeChange(t *testing.T) {
+func TestAddPendingKeepsTypeChangesScoped(t *testing.T) {
 	pending := make(map[string]change)
 	addPending(pending, change{path: "item", removed: true})
 	addPending(pending, change{path: "item", isDir: true})
-	if _, exists := pending["."]; !exists {
-		t.Fatal("file-to-directory replacement did not request a full sync")
+	if len(pending) != 1 || !pending["item"].isDir {
+		t.Fatalf("type change should retain only the latest changed path: %#v", pending)
 	}
 }
 
@@ -269,7 +264,7 @@ func TestFullSyncExcludesStateFiles(t *testing.T) {
 	}
 }
 
-func TestStateFileAncestorForcesFilteredFullSync(t *testing.T) {
+func TestStateFileAncestorUsesFilteredScope(t *testing.T) {
 	runner := &recordingRunner{}
 	s := syncer{
 		source: t.TempDir(),
@@ -282,7 +277,10 @@ func TestStateFileAncestorForcesFilteredFullSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := runner.commands[0].args[0]; got != "sync" {
-		t.Fatalf("command = %q, want filtered full sync", got)
+		t.Fatalf("command = %q, want scoped sync", got)
+	}
+	if got, want := runner.commands[0].rules, []string{"+ /.metadata", "+ /.metadata/**", "- /**"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("metadata ancestor scope = %#v, want %#v", got, want)
 	}
 }
 
@@ -303,12 +301,12 @@ func TestSyncerAppliesExcludes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(runner.commands) != 1 {
-		t.Fatalf("commands = %#v, want one filtered full sync", runner.commands)
+		t.Fatalf("commands = %#v, want one scoped sync", runner.commands)
 	}
 	args := runner.commands[0].args
 	want := []string{"--exclude", "*.tmp", "--exclude", "/cache/**"}
-	if !reflect.DeepEqual(args[len(args)-len(want):], want) {
-		t.Fatalf("sync args = %#v, want suffix %#v", args, want)
+	if !reflect.DeepEqual(args[len(args)-len(want)-2:len(args)-2], want) {
+		t.Fatalf("sync args = %#v, want exclusions %#v before scope filter", args, want)
 	}
 }
 
