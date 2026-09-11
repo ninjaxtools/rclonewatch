@@ -107,10 +107,12 @@ Watching and payload transfers:
 
 State file behavior:
   By default, rclonewatch coordinates writers and reconciles remote changes
-  through .rcw-state. It combines the persistent generation, unique sync_id,
-  incomplete-sync flag, and optional lock owner, timestamp, and TTL. Unlocking
-  clears the lock fields but does not delete the file. A destination without
-  remote state must be empty unless --force-delete-untracked-remote is supplied.
+  through .rcw-state. It combines a required repository_id UUID, the persistent
+  generation, unique sync_id, incomplete-sync flag, and optional lock owner,
+  timestamp, and TTL. State files without a repository ID are rejected, and
+  existing local and remote repository IDs must match. Unlocking clears the lock
+  fields but does not delete the file. A destination without remote state must be
+  empty unless --force-delete-untracked-remote is supplied.
   Initialization locks remote generation 0, clears its payload, fully syncs
   local to remote, then promotes both state files to generation 1. If local state
   is absent or older, startup performs a full remote-to-local sync, even if
@@ -135,11 +137,10 @@ State file behavior:
   is never written with this marker. Newer remote generations and conflicting
   sync IDs retain remote-to-local reconciliation priority after a broken session.
 
-  Legacy state without sync IDs remains readable. Incomplete states at equal
-  generations without IDs on either side require manual reconciliation because
-  the upload identity is ambiguous. Completed legacy states gain IDs on upload.
-  A missing active marker means inactive; completed legacy states can recover
-  an active session. Older readers may reject local state containing active.
+  State with a repository ID but no sync ID remains readable. Incomplete states
+  at equal generations without sync IDs on either side require manual
+  reconciliation because the upload identity is ambiguous. Completed states
+  gain sync IDs on upload. A missing active marker means inactive.
 
   State paths inside either payload root are excluded from payload transfers.
   When local and remote paths differ, both relative names are reserved.

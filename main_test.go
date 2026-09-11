@@ -470,7 +470,7 @@ func TestLostLockExitsWithoutSyncing(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "must-not-sync.txt"), []byte("contents"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	foreign := syncFileData{Generation: 1, Lock: &syncFileLock{Owner: "foreign", Timestamp: time.Now().UTC(), TTL: defaultLockTTL}}
+	foreign := syncFileData{RepositoryID: testRepositoryID, Generation: 1, Lock: &syncFileLock{Owner: "foreign", Timestamp: time.Now().UTC(), TTL: defaultLockTTL}}
 	contents, err := encodeSyncFile(foreign)
 	if err != nil {
 		t.Fatal(err)

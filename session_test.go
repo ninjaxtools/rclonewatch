@@ -176,7 +176,7 @@ func TestLegacyLocalStateStartsInactive(t *testing.T) {
 	runner := &memorySyncRunner{}
 	runner.setData(syncFileData{Generation: 4, SyncID: "same"})
 	state, source := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
-	writeTestFile(t, state.paths.local, `{"generation":4,"sync_id":"same","syncing":false}`)
+	writeTestFile(t, state.paths.local, `{"repository_id":"11111111-1111-4111-8111-111111111111","generation":4,"sync_id":"same","syncing":false}`)
 	if err := state.Acquire(make(chan os.Signal)); err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestLocalStateWriteFailurePreservesPreviousState(t *testing.T) {
 		return
 	}
 	path := filepath.Join(t.TempDir(), defaultStateFile)
-	previous := syncFileData{Generation: 1, SyncID: "previous", Active: true}
+	previous := syncFileData{RepositoryID: testRepositoryID, Generation: 1, SyncID: "previous", Active: true}
 	writeSyncState(t, path, previous)
 	var saved syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &saved); err != nil {
@@ -274,7 +274,7 @@ func TestLocalStateWriteFailurePreservesPreviousState(t *testing.T) {
 	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &limited); err != nil {
 		t.Fatal(err)
 	}
-	writeErr := writeLocalSyncFile(path, syncFileData{Generation: 2, SyncID: "next", Active: true, Syncing: true})
+	writeErr := writeLocalSyncFile(path, syncFileData{RepositoryID: testRepositoryID, Generation: 2, SyncID: "next", Active: true, Syncing: true})
 	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &saved); err != nil {
 		t.Fatal(err)
 	}

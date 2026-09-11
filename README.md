@@ -92,8 +92,9 @@ Backend detection uses the configured backend type, including environment-define
 
 ## State and reconciliation
 
-`.rcw-state` combines generation, sync identity, and synchronization status with the optional lock:
+`.rcw-state` combines repository identity, generation, sync identity, and synchronization status with the optional lock:
 
+- `repository_id` is a UUID created during initialization and retained in both local and remote state. The field is required; state files without it are rejected. Startup fails if existing local and remote state files have different repository IDs.
 - `generation` is a positive integer starting at `1`; remote generation `0` is reserved for an initialization in progress and is never written locally.
 - `sync_id` is a unique, randomly generated identifier for an upload attempt. Initialization creates one, and each outgoing batch (including recovery) creates a new one, written locally before publication remotely. It is retained after completion and through lock refreshes and release.
 - `syncing` is set to `true` locally and remotely, together with an incremented generation, before each outgoing payload batch. It returns to `false` only after every payload operation succeeds.
@@ -113,9 +114,9 @@ By default, startup initializes untracked destinations and reconciles generation
 
 Local state updates use a synced temporary file, atomic rename, and directory sync. Temporary sibling files matching `<local-state-file>.rcw-tmp-*` are reserved and excluded from payload transfers and change batching. When local state is initially absent, it is created with `active: true` after initialization or download succeeds; until then, absent local state or remote generation `0` ensures that interrupted startup work is retried.
 
-Older state files without `sync_id` remain readable and gain an ID on the next upload. Equal generations with no IDs on either side can skip reconciliation when both are complete, but incomplete states are ambiguous and require manual reconciliation. If only one side has an ID at equal generations, the IDs differ and remote-to-local reconciliation applies. All writers must support the new state field; older versions that reject unknown fields cannot read it.
+State files with a repository ID but without `sync_id` remain readable and gain a sync ID on the next upload. Equal generations with no sync IDs on either side can skip reconciliation when both are complete, but incomplete states are ambiguous and require manual reconciliation. If only one side has a sync ID at equal generations, the IDs differ and remote-to-local reconciliation applies.
 
-Local state without `active` is treated as inactive for compatibility. Completed legacy generations without sync IDs can recover an interrupted session using `active: true`; the ambiguous-incomplete-upload check still applies if either `syncing` flag is true. The active marker is never written to remote state. Older versions that reject unknown fields cannot read updated local state files containing it.
+Local state without `active` is treated as inactive. Completed generations without sync IDs can recover an interrupted session using `active: true`; the ambiguous-incomplete-upload check still applies if either `syncing` flag is true. The active marker is never written to remote state.
 
 **Warning:** Files are not necessarily synced to the remote in the order they were written locally. If a program writes multiple files and a later write assumes that an earlier one has already been persisted, an interrupted sync may leave the remote in an inconsistent state. Use `--fail-on-incomplete-sync` to stop before rclonewatch fully syncs that incomplete remote state to local, allowing it to be inspected and reconciled first.
 

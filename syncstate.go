@@ -27,11 +27,12 @@ const (
 )
 
 type syncFileData struct {
-	Generation uint64        `json:"generation"`
-	SyncID     string        `json:"sync_id,omitempty"`
-	Syncing    bool          `json:"syncing"`
-	Active     bool          `json:"active,omitempty"` // Local session marker; never published remotely.
-	Lock       *syncFileLock `json:"lock,omitempty"`
+	RepositoryID string        `json:"repository_id"`
+	Generation   uint64        `json:"generation"`
+	SyncID       string        `json:"sync_id,omitempty"`
+	Syncing      bool          `json:"syncing"`
+	Active       bool          `json:"active,omitempty"` // Local session marker; never published remotely.
+	Lock         *syncFileLock `json:"lock,omitempty"`
 }
 
 type syncFileLock struct {
@@ -59,6 +60,7 @@ type syncState struct {
 	logger                     *log.Logger
 	runner                     commandRunner
 	owner                      string
+	repositoryID               string
 	persistent                 bool
 	excludes                   []string
 	forceDeleteUntrackedRemote bool
@@ -87,6 +89,10 @@ func newSyncState(paths syncFilePaths, source, destination string, timeout time.
 		}
 		owner = hex.EncodeToString(ownerBytes)
 	}
+	repositoryID, err := newRepositoryID()
+	if err != nil {
+		return nil, err
+	}
 	return &syncState{
 		paths:            paths,
 		source:           source,
@@ -100,6 +106,7 @@ func newSyncState(paths syncFilePaths, source, destination string, timeout time.
 		logger:           logger,
 		runner:           runner,
 		owner:            owner,
+		repositoryID:     repositoryID,
 		persistent:       persistentID != "",
 		stop:             make(chan struct{}),
 		done:             make(chan struct{}),
@@ -190,6 +197,12 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 			return err
 		}
 		candidate := remote.data
+		if !remote.exists {
+			candidate.RepositoryID = s.repositoryID
+			if localExists {
+				candidate.RepositoryID = local.RepositoryID
+			}
+		}
 		candidate.Lock = s.newLock()
 		writtenAt := time.Now()
 		verifyDeadline := writtenAt.Add(s.timeout - s.refreshSafetyWindow())
@@ -232,7 +245,7 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 			}
 			return writeErr
 		}
-		if !current.ownedBy(s.owner) || current.data.Generation != candidate.Generation || current.data.SyncID != candidate.SyncID || current.data.Syncing != candidate.Syncing {
+		if !current.ownedBy(s.owner) || current.data.RepositoryID != candidate.RepositoryID || current.data.Generation != candidate.Generation || current.data.SyncID != candidate.SyncID || current.data.Syncing != candidate.Syncing {
 			if canWait && current.data.Lock != nil {
 				if defaultWait && observedLock != "" && current.lockIdentity() != observedLock {
 					return errors.New("remote lock was refreshed while waiting")
@@ -247,6 +260,9 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 }
 
 func (s *syncState) validateAcquisition(local syncFileData, localExists bool, remote remoteSyncFile) error {
+	if localExists && remote.exists && local.RepositoryID != remote.data.RepositoryID {
+		return fmt.Errorf("local repository ID %q does not match remote repository ID %q", local.RepositoryID, remote.data.RepositoryID)
+	}
 	if s.failOnIncomplete && remote.exists && remote.data.Syncing && needsSyncFromRemote(local, localExists, remote.data) {
 		return errors.New("remote state indicates an incomplete sync requiring remote-to-local reconciliation")
 	}
@@ -323,7 +339,7 @@ func (s *syncState) InitializeRemote() error {
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("complete remote initialization: %w", err)
 	}
-	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: 1, SyncID: candidate.SyncID, Active: true}); err != nil {
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{RepositoryID: candidate.RepositoryID, Generation: 1, SyncID: candidate.SyncID, Active: true}); err != nil {
 		return fmt.Errorf("write initial local state: %w", err)
 	}
 	if s.logs {
@@ -368,7 +384,7 @@ func (s *syncState) InitializeGeneration() error {
 		if err := s.syncFromRemote(); err != nil {
 			return err
 		}
-		return writeLocalSyncFile(s.paths.local, syncFileData{Generation: remote.data.Generation, SyncID: remote.data.SyncID, Syncing: remote.data.Syncing, Active: true})
+		return writeLocalSyncFile(s.paths.local, syncFileData{RepositoryID: remote.data.RepositoryID, Generation: remote.data.Generation, SyncID: remote.data.SyncID, Syncing: remote.data.Syncing, Active: true})
 	}
 	localIncompleteAdvance := local.Syncing && local.Generation == remote.data.Generation+1
 	if local.Generation > remote.data.Generation && !localIncompleteAdvance {
@@ -408,7 +424,7 @@ func (s *syncState) BeforeRemoteChange() error {
 	}
 	next := remote.data.Generation + 1
 	syncID := rand.Text()
-	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: next, SyncID: syncID, Syncing: true, Active: true}); err != nil {
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{RepositoryID: remote.data.RepositoryID, Generation: next, SyncID: syncID, Syncing: true, Active: true}); err != nil {
 		return fmt.Errorf("increment local generation: %w", err)
 	}
 	candidate := remote.data
@@ -433,7 +449,7 @@ func (s *syncState) AfterRemoteChange() error {
 	if err := s.replaceOwnedRemote(remote, candidate); err != nil {
 		return fmt.Errorf("clear remote syncing flag: %w", err)
 	}
-	if err := writeLocalSyncFile(s.paths.local, syncFileData{Generation: candidate.Generation, SyncID: candidate.SyncID, Active: true}); err != nil {
+	if err := writeLocalSyncFile(s.paths.local, syncFileData{RepositoryID: candidate.RepositoryID, Generation: candidate.Generation, SyncID: candidate.SyncID, Active: true}); err != nil {
 		return fmt.Errorf("clear local syncing flag: %w", err)
 	}
 	if s.logs {
@@ -842,7 +858,7 @@ func sameLock(left, right *syncFileLock) bool {
 }
 
 func sameSyncFileData(left, right syncFileData) bool {
-	return left.Generation == right.Generation && left.SyncID == right.SyncID && left.Syncing == right.Syncing && sameLock(left.Lock, right.Lock)
+	return left.RepositoryID == right.RepositoryID && left.Generation == right.Generation && left.SyncID == right.SyncID && left.Syncing == right.Syncing && sameLock(left.Lock, right.Lock)
 }
 
 func readLocalSyncFile(path string) (syncFileData, bool, error) {
@@ -864,6 +880,9 @@ func readLocalSyncFile(path string) (syncFileData, bool, error) {
 }
 
 func writeLocalSyncFile(path string, data syncFileData) error {
+	if data.RepositoryID == "" {
+		return errors.New("repository ID must be set")
+	}
 	if data.Generation == 0 {
 		return errors.New("generation must be at least 1")
 	}
@@ -906,6 +925,9 @@ func writeLocalSyncFile(path string, data syncFileData) error {
 }
 
 func encodeSyncFile(data syncFileData) ([]byte, error) {
+	if data.RepositoryID == "" {
+		return nil, errors.New("repository ID must be set")
+	}
 	contents, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return nil, err
@@ -920,6 +942,9 @@ func decodeSyncFile(contents []byte) (syncFileData, error) {
 	if err := decoder.Decode(&data); err != nil {
 		return syncFileData{}, err
 	}
+	if data.RepositoryID == "" {
+		return syncFileData{}, errors.New("repository ID must be set")
+	}
 	if data.Lock != nil && (data.Lock.Owner == "" || data.Lock.Timestamp.IsZero()) {
 		return syncFileData{}, errors.New("lock owner and timestamp must be set")
 	}
@@ -927,6 +952,16 @@ func decodeSyncFile(contents []byte) (syncFileData, error) {
 		return syncFileData{}, errors.New("lock TTL must not be negative")
 	}
 	return data, nil
+}
+
+func newRepositoryID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("create repository ID: %w", err)
+	}
+	id[6] = id[6]&0x0f | 0x40
+	id[8] = id[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", id[0:4], id[4:6], id[6:8], id[8:10], id[10:16]), nil
 }
 
 func responseETag(output string) string {

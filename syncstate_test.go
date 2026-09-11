@@ -11,11 +11,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+const testRepositoryID = "11111111-1111-4111-8111-111111111111"
 
 type memorySyncRunner struct {
 	mu                  sync.Mutex
@@ -68,7 +71,8 @@ func (r *memorySyncRunner) Run(args []string, stdout, stderr io.Writer) error {
 		if r.conditionalFailures > 0 {
 			r.conditionalFailures--
 			r.value = encodeTestSyncFile(syncFileData{
-				Generation: 1,
+				RepositoryID: testRepositoryID,
+				Generation:   1,
 				Lock: &syncFileLock{
 					Owner:     "competing-writer",
 					Timestamp: time.Now().UTC(),
@@ -112,6 +116,9 @@ func (r *memorySyncRunner) Run(args []string, stdout, stderr io.Writer) error {
 }
 
 func (r *memorySyncRunner) setData(data syncFileData) {
+	if data.RepositoryID == "" {
+		data.RepositoryID = testRepositoryID
+	}
 	r.mu.Lock()
 	r.value = encodeTestSyncFile(data)
 	r.mu.Unlock()
@@ -786,12 +793,55 @@ func TestEmptyRemoteAcquiresInitializationLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := runner.data(t)
-	if remote.Generation != 0 || remote.Lock == nil || remote.Lock.Owner != state.owner || remote.Lock.TTL != time.Hour {
+	if remote.RepositoryID == "" || remote.Generation != 0 || remote.Lock == nil || remote.Lock.Owner != state.owner || remote.Lock.TTL != time.Hour {
 		t.Fatalf("initial remote state = %#v, want owned generation 0", remote)
 	}
 	state.Start()
 	if err := state.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInitializedRepositoryHasUUID(t *testing.T) {
+	runner := &memorySyncRunner{}
+	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.InitializeGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	local, exists, err := readLocalSyncFile(state.paths.local)
+	if err != nil || !exists {
+		t.Fatalf("read local state: exists=%v, error=%v", exists, err)
+	}
+	remote := runner.data(t)
+	if local.RepositoryID != remote.RepositoryID {
+		t.Fatalf("repository IDs differ: local=%q remote=%q", local.RepositoryID, remote.RepositoryID)
+	}
+	if matched := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(local.RepositoryID); !matched {
+		t.Fatalf("repository ID = %q, want UUID v4", local.RepositoryID)
+	}
+}
+
+func TestSyncStateRejectsRepositoryIDMismatch(t *testing.T) {
+	runner := &memorySyncRunner{}
+	runner.setData(syncFileData{RepositoryID: "22222222-2222-4222-8222-222222222222", Generation: 1})
+	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
+	writeSyncState(t, state.paths.local, syncFileData{RepositoryID: testRepositoryID, Generation: 1})
+
+	err := state.Acquire(make(chan os.Signal))
+	if err == nil || !strings.Contains(err.Error(), "does not match remote repository ID") {
+		t.Fatalf("Acquire error = %v, want repository ID mismatch", err)
+	}
+	if got := runner.writes(); got != 0 {
+		t.Fatalf("remote state writes = %d, want 0", got)
+	}
+}
+
+func TestStateFileRequiresRepositoryID(t *testing.T) {
+	if _, err := decodeSyncFile([]byte(`{"generation":1,"syncing":false}`)); err == nil || !strings.Contains(err.Error(), "repository ID must be set") {
+		t.Fatalf("decode error = %v, want required repository ID", err)
 	}
 }
 
@@ -824,7 +874,7 @@ func TestSyncStateRecoversUnpublishedLocalGeneration(t *testing.T) {
 	runner := &memorySyncRunner{}
 	runner.setData(syncFileData{Generation: 4})
 	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
-	if err := writeLocalSyncFile(state.paths.local, syncFileData{Generation: 5, Syncing: true}); err != nil {
+	if err := writeLocalSyncFile(state.paths.local, syncFileData{RepositoryID: testRepositoryID, Generation: 5, Syncing: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := state.Acquire(make(chan os.Signal)); err != nil {
@@ -1287,6 +1337,9 @@ func readTestFile(t *testing.T, path string) string {
 
 func writeSyncState(t *testing.T, path string, data syncFileData) {
 	t.Helper()
+	if data.RepositoryID == "" {
+		data.RepositoryID = testRepositoryID
+	}
 	if err := writeLocalSyncFile(path, data); err != nil {
 		t.Fatal(err)
 	}
@@ -1312,6 +1365,9 @@ func assertSyncID(t *testing.T, path, want string) {
 }
 
 func encodeTestSyncFile(data syncFileData) string {
+	if data.RepositoryID == "" {
+		data.RepositoryID = testRepositoryID
+	}
 	contents, err := encodeSyncFile(data)
 	if err != nil {
 		panic(err)
