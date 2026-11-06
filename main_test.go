@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -620,8 +621,8 @@ func TestRuntimeErrorsRequireLogs(t *testing.T) {
 
 	err := cmd.Run()
 	var exitError *exec.ExitError
-	if !errors.As(err, &exitError) || exitError.ExitCode() != 1 {
-		t.Fatalf("process error = %v, want exit status 1", err)
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 127 {
+		t.Fatalf("process error = %v, want exit status 127", err)
 	}
 	if stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("output without --logs: stdout %q, stderr %q", stdout.String(), stderr.String())
@@ -706,7 +707,9 @@ type testProcess struct {
 	stderr *bytes.Buffer
 }
 
-func startTestProcess(t *testing.T, args ...string) *testProcess {
+// launchTestProcess runs rclonewatch with args through the test binary and
+// passes each line it writes to standard output to onLine.
+func launchTestProcess(t *testing.T, onLine func(string), args ...string) *testProcess {
 	t.Helper()
 	commandArgs := []string{"-test.run=^TestRclonewatchHelper$", "--"}
 	commandArgs = append(commandArgs, args...)
@@ -723,29 +726,143 @@ func startTestProcess(t *testing.T, args ...string) *testProcess {
 	}
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
-	ready := make(chan struct{})
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
-			if strings.Contains(scanner.Text(), "watching") {
-				select {
-				case <-ready:
-				default:
-					close(ready)
-				}
+			if onLine != nil {
+				onLine(scanner.Text())
 			}
 		}
 	}()
+	return &testProcess{cmd: cmd, wait: wait, stderr: &stderr}
+}
+
+// startTestProcess launches rclonewatch and waits until it reports watching.
+func startTestProcess(t *testing.T, args ...string) *testProcess {
+	t.Helper()
+	ready := make(chan struct{})
+	var once sync.Once
+	process := launchTestProcess(t, func(line string) {
+		if strings.Contains(line, "watching") {
+			once.Do(func() { close(ready) })
+		}
+	}, args...)
 
 	select {
 	case <-ready:
-	case err := <-wait:
-		t.Fatalf("process exited before watching: %v: %s", err, stderr.String())
+	case err := <-process.wait:
+		t.Fatalf("process exited before watching: %v: %s", err, process.stderr.String())
 	case <-time.After(15 * time.Second):
-		cmd.Process.Kill()
+		process.cmd.Process.Kill()
 		t.Fatal("timed out waiting for watcher startup")
 	}
-	return &testProcess{cmd: cmd, wait: wait, stderr: &stderr}
+	return process
+}
+
+// slowRcloneSync puts an rclone shim on PATH whose sync command records the
+// marker file and then blocks; every other command runs the real rclone.
+func slowRcloneSync(t *testing.T) (marker string) {
+	t.Helper()
+	real, err := exec.LookPath("rclone")
+	if err != nil {
+		t.Skip("rclone is not installed")
+	}
+	bin := t.TempDir()
+	marker = filepath.Join(bin, "sync-started")
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = sync ]; then : > %q; exec sleep 30; fi\nexec %q \"$@\"\n", marker, real)
+	if err := os.WriteFile(filepath.Join(bin, "rclone"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return marker
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertExitCode(t *testing.T, process *testProcess, want int) {
+	t.Helper()
+	err := process.waitForExit(t)
+	got := 0
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		got = exitError.ExitCode()
+	} else if err != nil {
+		t.Fatalf("process exit: %v: %s", err, process.stderr.String())
+	}
+	if got != want {
+		t.Fatalf("process exit status = %d, want %d; stderr: %s", got, want, process.stderr.String())
+	}
+}
+
+func TestSignalDuringStartupReconciliationAborts(t *testing.T) {
+	marker := slowRcloneSync(t)
+	source, destination := t.TempDir(), t.TempDir()
+	writeSyncState(t, filepath.Join(destination, defaultStateFile), syncFileData{Generation: 2, SyncID: "remote"})
+	writeTestFile(t, filepath.Join(destination, "payload.txt"), "remote payload")
+
+	// Absent local state requires a remote-to-local sync, which the shim blocks.
+	process := launchTestProcess(t, nil, "--logs", source, destination)
+	waitForFile(t, marker)
+	if err := process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	assertExitCode(t, process, 143)
+
+	// The blocked download was cancelled before local state could be created,
+	// so the next start retries it, and the lock was released on the way out.
+	if _, err := os.Stat(filepath.Join(source, defaultStateFile)); !os.IsNotExist(err) {
+		t.Fatalf("local state after interrupted startup: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(source, "payload.txt")); !os.IsNotExist(err) {
+		t.Fatalf("payload was downloaded despite the cancelled sync: %v", err)
+	}
+	assertSyncState(t, filepath.Join(destination, defaultStateFile), 2, false, false)
+}
+
+func TestRepeatedSignalAbandonsFinalSync(t *testing.T) {
+	marker := slowRcloneSync(t)
+	source, destination := t.TempDir(), t.TempDir()
+	process := startTestProcess(t, "--upload-only", "--logs", source, destination)
+	writeTestFile(t, filepath.Join(source, "pending.txt"), "contents")
+
+	if err := process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	waitForFile(t, marker)
+	if err := process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	assertExitCode(t, process, 1)
+}
+
+func TestWrappedCommandStartFailureFinishesSession(t *testing.T) {
+	if _, err := exec.LookPath("rclone"); err != nil {
+		t.Skip("rclone is not installed")
+	}
+	source, destination := t.TempDir(), t.TempDir()
+	writeTestFile(t, filepath.Join(source, "payload.txt"), "contents")
+	process := launchTestProcess(t, nil, "--logs", source, destination, "--", filepath.Join(t.TempDir(), "missing-command"))
+	assertExitCode(t, process, 127)
+
+	// The session still completes: payload is synced, the lock is released,
+	// and the local session is no longer marked active.
+	if got := readTestFile(t, filepath.Join(destination, "payload.txt")); got != "contents" {
+		t.Fatalf("synced payload = %q", got)
+	}
+	assertSyncState(t, filepath.Join(destination, defaultStateFile), 1, false, false)
+	assertLocalActive(t, source, false)
 }
 
 func (p *testProcess) waitForExit(t *testing.T) error {

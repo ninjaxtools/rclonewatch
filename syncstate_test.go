@@ -1268,10 +1268,10 @@ func TestSyncStateWaitCanBeInterrupted(t *testing.T) {
 	interrupt <- os.Interrupt
 	state, _ := newMemoryState(t, runner, time.Hour, lockWait{infinite: true}, false, false)
 	err := state.Acquire(interrupt)
-	if !errors.Is(err, errLockInterrupted) {
-		t.Fatalf("Acquire error = %v, want errLockInterrupted", err)
+	if !errors.Is(err, errInterrupted) {
+		t.Fatalf("Acquire error = %v, want errInterrupted", err)
 	}
-	var interrupted lockInterruptedError
+	var interrupted interruptedError
 	if !errors.As(err, &interrupted) || interrupted.signal != os.Interrupt {
 		t.Fatalf("Acquire error = %#v, want the interrupting signal", err)
 	}
@@ -1414,4 +1414,25 @@ func encodeTestSyncFile(data syncFileData) string {
 		panic(err)
 	}
 	return strings.TrimSpace(string(contents))
+}
+
+func TestSyncStateCloseWithoutStart(t *testing.T) {
+	runner := &memorySyncRunner{}
+	state, _ := newMemoryState(t, runner, time.Hour, lockWait{}, false, false)
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- state.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked without a started refresh loop")
+	}
+	if data := runner.data(t); data.Lock != nil {
+		t.Fatalf("lock was not released: %#v", data)
+	}
 }

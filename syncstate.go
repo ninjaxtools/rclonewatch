@@ -17,16 +17,21 @@ import (
 )
 
 var (
-	errLockInterrupted   = errors.New("interrupted while waiting for remote lock")
+	errInterrupted       = errors.New("interrupted by signal")
 	errLockOwnershipLost = errors.New("remote state file ownership was lost")
 )
 
-// lockInterruptedError records the signal that interrupted lock acquisition so
-// the process can exit with the conventional 128+signal status.
-type lockInterruptedError struct{ signal os.Signal }
+// interruptedError records the signal that interrupted startup work so the
+// process can exit with the conventional 128+signal status.
+type interruptedError struct {
+	signal os.Signal
+	phase  string
+}
 
-func (e lockInterruptedError) Error() string        { return errLockInterrupted.Error() }
-func (e lockInterruptedError) Is(target error) bool { return target == errLockInterrupted }
+func (e interruptedError) Error() string {
+	return fmt.Sprintf("interrupted by %v while %s", e.signal, e.phase)
+}
+func (e interruptedError) Is(target error) bool { return target == errInterrupted }
 
 const (
 	lockPollInterval     = time.Second
@@ -191,7 +196,7 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 			select {
 			case sig := <-interrupt:
 				timer.Stop()
-				return lockInterruptedError{sig}
+				return interruptedError{sig, "waiting for remote lock"}
 			case <-timer.C:
 			}
 			remote, err = s.readRemote()
@@ -315,7 +320,7 @@ func (s *syncState) verifyAcquiredLock(deadline time.Time, interrupt <-chan os.S
 		select {
 		case sig := <-interrupt:
 			timer.Stop()
-			return remoteSyncFile{}, lockInterruptedError{sig}
+			return remoteSyncFile{}, interruptedError{sig, "verifying the acquired lock"}
 		case <-timer.C:
 		}
 	}
@@ -489,6 +494,12 @@ func (s *syncState) Start() <-chan error {
 func (s *syncState) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.stop)
+		// Without a refresh loop there is nothing to wait for; the channels it
+		// would have closed must still be closed so Close cannot block.
+		s.startOnce.Do(func() {
+			close(s.errors)
+			close(s.done)
+		})
 		<-s.done
 		if s.releaseRunner != nil {
 			s.runner = s.releaseRunner

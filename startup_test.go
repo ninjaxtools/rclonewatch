@@ -52,7 +52,7 @@ func TestStartupRetainsWritesAfterInitialScan(t *testing.T) {
 		}
 	})
 	pending := make(map[string]change)
-	if err := initializeWatching(state, w, pending); err != nil {
+	if err := initializeWatching(state, w, pending, nil); err != nil {
 		t.Fatal(err)
 	}
 	w.Close()
@@ -93,7 +93,7 @@ func TestStartupDrainsMoreThanWatchChannelCapacity(t *testing.T) {
 		}
 	})
 	pending := make(map[string]change)
-	if err := initializeWatching(state, w, pending); err != nil {
+	if err := initializeWatching(state, w, pending, nil); err != nil {
 		t.Fatal(err)
 	}
 	w.Close()

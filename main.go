@@ -133,12 +133,6 @@ func (s *syncer) Sync(batch map[string]change) error {
 			return fmt.Errorf("advance generation: %w", err)
 		}
 	}
-	complete := func() error {
-		if !s.trackState {
-			return nil
-		}
-		return s.state.AfterRemoteChange()
-	}
 
 	if paths[0] == "." {
 		if err := s.fullSync(); err != nil {
@@ -147,8 +141,10 @@ func (s *syncer) Sync(batch map[string]change) error {
 	} else if err := s.syncScopes(paths); err != nil {
 		return err
 	}
-	if err := complete(); err != nil {
-		return err
+	if s.trackState {
+		if err := s.state.AfterRemoteChange(); err != nil {
+			return err
+		}
 	}
 
 	if s.logs {
@@ -185,6 +181,17 @@ func addPending(pending map[string]change, item change) {
 	pending[item.path] = item
 }
 
+// queueChange records a watcher event unless it concerns sync-state metadata,
+// which is never part of the payload.
+func queueChange(state *syncState, pending map[string]change, item change) {
+	if state != nil {
+		if exact, _ := state.protects(item.path); exact {
+			return
+		}
+	}
+	addPending(pending, item)
+}
+
 func mergeFailedBatch(pending, failed map[string]change) {
 	for path, item := range failed {
 		if _, exists := pending[path]; !exists {
@@ -217,6 +224,15 @@ func signalExitCode(sig os.Signal) int {
 	return 1
 }
 
+// startExitCode follows the shell convention for a command that cannot run:
+// 127 when it does not exist and 126 when it cannot be executed.
+func startExitCode(err error) int {
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+		return 127
+	}
+	return 126
+}
+
 func signalCommandGroup(cmd *exec.Cmd, signal os.Signal) error {
 	sig, ok := signal.(syscall.Signal)
 	if !ok {
@@ -227,11 +243,18 @@ func signalCommandGroup(cmd *exec.Cmd, signal os.Signal) error {
 
 // Drain events while startup reconciliation runs, so large downloads cannot
 // block the watcher and writes made during the startup scan remain pending.
-func initializeWatching(state *syncState, watcher *watcher, pending map[string]change) error {
+// A signal cancels the reconciliation, which is retried at the next start, and
+// is reported as an interruptedError once the cancelled work has returned.
+func initializeWatching(state *syncState, watcher *watcher, pending map[string]change, signals <-chan os.Signal) error {
 	done := make(chan error, 1)
 	go func() { done <- state.InitializeGeneration() }()
 	eventC, errorC := watcher.Events(), watcher.Errors()
-	var watcherErr error
+	var watcherErr, interrupted error
+	cancel := func() {
+		if state.cancelCommands != nil {
+			state.cancelCommands()
+		}
+	}
 	for {
 		select {
 		case item, ok := <-eventC:
@@ -239,9 +262,7 @@ func initializeWatching(state *syncState, watcher *watcher, pending map[string]c
 				eventC = nil
 				continue
 			}
-			if exact, _ := state.protects(item.path); !exact {
-				addPending(pending, item)
-			}
+			queueChange(state, pending, item)
 		case err, ok := <-errorC:
 			if !ok {
 				errorC = nil
@@ -249,11 +270,17 @@ func initializeWatching(state *syncState, watcher *watcher, pending map[string]c
 			}
 			if err != nil && watcherErr == nil {
 				watcherErr = err
-				if state.cancelCommands != nil {
-					state.cancelCommands()
-				}
+				cancel()
+			}
+		case sig := <-signals:
+			if interrupted == nil {
+				interrupted = interruptedError{sig, "reconciling startup state"}
+				cancel()
 			}
 		case err := <-done:
+			if interrupted != nil {
+				return interrupted
+			}
 			if watcherErr != nil {
 				return fmt.Errorf("watch during initialization: %w", watcherErr)
 			}
@@ -296,7 +323,7 @@ func run(cfg config) (exitCode int) {
 		if err := state.Acquire(signals); err != nil {
 			// An interrupted wait must not look like a successful run,
 			// especially when the wrapped command never started.
-			var interrupted lockInterruptedError
+			var interrupted interruptedError
 			if errors.As(err, &interrupted) {
 				logger.Printf("%v", err)
 				return signalExitCode(interrupted.signal)
@@ -325,7 +352,12 @@ func run(cfg config) (exitCode int) {
 	}()
 	pending := make(map[string]change)
 	if state != nil {
-		if err := initializeWatching(state, watcher, pending); err != nil {
+		if err := initializeWatching(state, watcher, pending, signals); err != nil {
+			var interrupted interruptedError
+			if errors.As(err, &interrupted) {
+				logger.Printf("%v", err)
+				return signalExitCode(interrupted.signal)
+			}
 			// A failed lock refresh cancels startup work; report the cause
 			// rather than the resulting cancellation.
 			select {
@@ -360,6 +392,11 @@ func run(cfg config) (exitCode int) {
 		excludes:   append([]string(nil), cfg.excludes...),
 	}
 
+	var active, stopping, watcherClosed, finalAttempted, syncReady, abandoned bool
+	var watcherErr, lockErr, lastSyncErr error
+	wrappedExitCode := 0
+	signalsSeen := 0
+
 	var wrapped *exec.Cmd
 	var commandDone <-chan int
 	if len(cfg.command) > 0 {
@@ -373,21 +410,26 @@ func run(cfg config) (exitCode int) {
 		wrapped.Stdout = os.Stdout
 		wrapped.Stderr = os.Stderr
 		if err := wrapped.Start(); err != nil {
-			watcher.Close()
+			// Shut down as if the command had exited: pending changes are
+			// still synced and the session is finished rather than left
+			// active, which would force a full recovery upload next time.
 			logger.Printf("start wrapped command: %v", err)
-			return 1
-		}
-		done := make(chan int, 1)
-		commandDone = done
-		if foreground {
-			tty.started()
-			go func() { done <- tty.wait(wrapped) }()
+			wrappedExitCode = startExitCode(err)
+			stopping = true
+			watcher.Close()
 		} else {
-			go func() { done <- commandExitCode(wrapped.Wait()) }()
+			done := make(chan int, 1)
+			commandDone = done
+			if foreground {
+				tty.started()
+				go func() { done <- tty.wait(wrapped) }()
+			} else {
+				go func() { done <- commandExitCode(wrapped.Wait()) }()
+			}
 		}
 	}
 
-	if cfg.logs {
+	if cfg.logs && !stopping {
 		logger.Printf("watching %q for changes", cfg.source)
 	}
 
@@ -396,13 +438,12 @@ func run(cfg config) (exitCode int) {
 	var timerC <-chan time.Time
 	if cfg.interval > 0 {
 		timer = time.NewTimer(cfg.interval)
-		timerC = timer.C
 		defer timer.Stop()
+		if !stopping {
+			timerC = timer.C
+		}
 	}
 
-	var active, stopping, watcherClosed, finalAttempted, syncReady bool
-	var watcherErr, lockErr, lastSyncErr error
-	wrappedExitCode := 0
 	retryDelay := initialRetryDelay
 	eventC := watcher.Events()
 	errorC := watcher.Errors()
@@ -470,13 +511,7 @@ func run(cfg config) (exitCode int) {
 				eventC = nil
 				continue
 			}
-			if state != nil {
-				exact, _ := state.protects(item.path)
-				if exact {
-					continue
-				}
-			}
-			addPending(pending, item)
+			queueChange(state, pending, item)
 			if syncReady && !active && !stopping {
 				syncReady = false
 				startSync(false)
@@ -512,7 +547,9 @@ func run(cfg config) (exitCode int) {
 			}
 		case result := <-results:
 			active = false
-			lastSyncErr = result.err
+			if !abandoned {
+				lastSyncErr = result.err
+			}
 			if result.err != nil {
 				if errors.Is(result.err, errLockOwnershipLost) {
 					abortForLockFailure(result.err)
@@ -559,9 +596,13 @@ func run(cfg config) (exitCode int) {
 			watcher.Close()
 		case sig := <-signals:
 			if commandDone != nil {
+				// The command decides how to react; shutdown proceeds once it exits.
 				_ = signalCommandGroup(wrapped, sig)
+			} else {
+				signalsSeen++
 			}
-			if !stopping {
+			switch {
+			case !stopping:
 				stopping = true
 				timerC = nil
 				syncReady = false
@@ -570,6 +611,22 @@ func run(cfg config) (exitCode int) {
 				}
 				if commandDone == nil {
 					watcher.Close()
+				}
+			case commandDone != nil || abandoned:
+			case signalsSeen < 2:
+				if cfg.logs {
+					logger.Printf("shutdown already in progress; send %v again to abandon the final sync", sig)
+				}
+			default:
+				// Only the final sync remains. A repeated signal abandons it so
+				// the process is never uninterruptible; the incomplete session
+				// is recovered at the next start.
+				abandoned = true
+				finalAttempted = true
+				lastSyncErr = fmt.Errorf("abandoned after repeated %v", sig)
+				runner.Cancel()
+				if cfg.logs {
+					logger.Printf("%v received again; abandoning the final sync", sig)
 				}
 			}
 		}
@@ -610,31 +667,14 @@ func parseConfig(args []string) (config, error) {
 	if cfg.interval < 0 {
 		return config{}, errors.New("--interval must not be negative")
 	}
-	lockTTLSet := false
-	lockWaitSet := false
-	persistentLockSet := false
-	stateFileSet := false
-	stateFileLocalSet := false
-	stateFileRemoteSet := false
-	flags.Visit(func(item *flag.Flag) {
-		if item.Name == "lock-ttl" {
-			lockTTLSet = true
-		}
-		if item.Name == "lock-wait" {
-			lockWaitSet = true
-		}
-		if item.Name == "persistent-lock" {
-			persistentLockSet = true
-		}
-		switch item.Name {
-		case "state-file":
-			stateFileSet = true
-		case "state-file-local":
-			stateFileLocalSet = true
-		case "state-file-remote":
-			stateFileRemoteSet = true
-		}
-	})
+	set := make(map[string]bool)
+	flags.Visit(func(item *flag.Flag) { set[item.Name] = true })
+	lockTTLSet := set["lock-ttl"]
+	lockWaitSet := set["lock-wait"]
+	persistentLockSet := set["persistent-lock"]
+	stateFileSet := set["state-file"]
+	stateFileLocalSet := set["state-file-local"]
+	stateFileRemoteSet := set["state-file-remote"]
 	if cfg.lockTimeout <= 0 {
 		return config{}, errors.New("--lock-ttl must be greater than zero")
 	}
