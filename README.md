@@ -5,7 +5,7 @@
 The most common mode of operation wraps a program that changes the watched directory. In the following example `./build.sh` is executed through rclonewatch, and changes are synced every 30 seconds (`--interval 30s`), excluding temporary files (`--exclude '*.tmp'`), and a final sync runs after the command exits.
 
 ```sh
-./rclonewatch --interval 30s --exclude '*.tmp' --logs \
+./target/rclonewatch --interval 30s --exclude '*.tmp' --logs \
   /srv/data remote:backup/data -- ./build.sh --release
 ```
 
@@ -15,7 +15,9 @@ Any changes to the watched directory, whether made by a wrapped program or not a
 
 ## Installation
 
-Build it with `go build -o rclonewatch .`.
+Build it with `make build` (or `go build -o target/rclonewatch ./src`).
+`make install` builds and links it into `~/.local/bin`; override `PREFIX` to change
+the installation prefix. Linux and Go 1.26+ are required to build from source.
 
 Prebuilt Linux binaries for amd64 and arm64 are attached to each [GitHub release](https://github.com/ninjaxtools/rclonewatch/releases).
 
@@ -43,7 +45,7 @@ export RCLONE_CONFIG_S3_REGION=us-east-1
 In either case, set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN` for temporary credentials), then use the config section or environment remote name as the destination:
 
 ```sh
-./rclonewatch --interval 30s /srv/data s3:my-bucket/backup/data
+./target/rclonewatch --interval 30s /srv/data s3:my-bucket/backup/data
 ```
 
 For other S3-compatible services, set the provider and endpoint described in [rclone's S3 configuration documentation](https://rclone.org/s3/).
@@ -120,6 +122,21 @@ Local state without `active` is treated as inactive. Completed generations witho
 
 **Warning:** Files are not necessarily synced to the remote in the order they were written locally. If a program writes multiple files and a later write assumes that an earlier one has already been persisted, an interrupted sync may leave the remote in an inconsistent state. Use `--fail-on-incomplete-sync` to stop before rclonewatch fully syncs that incomplete remote state to local, allowing it to be inspected and reconciled first.
 
+## Development
+
+Go sources and tests live in `src/`, with `go.mod` at the repository root.
+Generated binaries, release archives, and staging files live in ignored `target/`.
+
+```sh
+make build                       # target/rclonewatch
+make check                       # tests and go vet
+make release                     # Linux amd64/arm64 binaries, archives, and SHA256 files
+make release-platform GOOS=linux GOARCH=arm64
+make clean                       # remove target/
+```
+
+Tests that exercise real synchronization require `rclone` on `PATH`.
+
 ## Releasing
 
 Run the minor-version release script from a clean worktree:
@@ -127,3 +144,7 @@ Run the minor-version release script from a clean worktree:
 ```sh
 ./publish-minor
 ```
+
+Version tags trigger GitHub Actions tests and Linux amd64/arm64 builds using the
+same Makefile targets. Releases contain `rclonewatch_linux_<arch>.tar.gz` and
+matching `.sha256` files, with the executable named `rclonewatch` inside each archive.
