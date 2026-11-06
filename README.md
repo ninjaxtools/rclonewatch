@@ -50,6 +50,12 @@ In either case, set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and `AWS_SE
 
 For other S3-compatible services, set the provider and endpoint described in [rclone's S3 configuration documentation](https://rclone.org/s3/).
 
+S3 buckets must already exist. rclonewatch passes `--s3-no-check-bucket` to every
+rclone command, including state writes, payload uploads, upload-only mode, and
+lock release. It does not attempt to create buckets or require bucket-creation
+permissions. Prefixes within an existing bucket are created as objects are uploaded;
+normal object read/write/list permissions are still required.
+
 ## Usage
 
 Arguments:

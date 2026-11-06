@@ -68,7 +68,11 @@ func (r *rcloneCommand) Run(args []string, stdout, stderr io.Writer) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, "rclone", args...)
+	// Buckets are provisioned separately. Apply this to every command so state
+	// writes, payload uploads, upload-only mode, and lock release all agree.
+	// Rclone ignores this S3-specific flag for other backends.
+	commandArgs := append(append([]string(nil), args...), "--s3-no-check-bucket")
+	cmd := exec.CommandContext(ctx, "rclone", commandArgs...)
 	if stdout != nil || stderr != nil {
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr

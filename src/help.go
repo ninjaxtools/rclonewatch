@@ -109,6 +109,11 @@ Watching and payload transfers:
   ancestor scope. Transfers use --ignore-times so matching size/mtime cannot hide
   changed content; only files included within the selected scopes are recopied.
 
+S3 buckets:
+  Buckets must already exist. Every rclone command uses --s3-no-check-bucket
+  so bucket creation permissions are not needed. Object read/write/list
+  permissions are still required; prefixes are created as objects are uploaded.
+
 State file behavior:
   By default, rclonewatch coordinates writers and reconciles remote changes
   through .rcw-state. It combines a required repository_id UUID, the persistent
