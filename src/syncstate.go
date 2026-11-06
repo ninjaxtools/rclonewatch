@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -777,6 +778,18 @@ func (s *syncState) readRemote() (remoteSyncFile, error) {
 		}
 		return remoteSyncFile{}, commandError(err, stderr.String())
 	}
+	// Object-store backends can treat a missing object as an empty directory:
+	// cat then succeeds without output. Do not confuse that with a zero-byte
+	// state object, which is corrupt and must never be silently replaced.
+	if stdout.Len() == 0 {
+		exists, err := s.remoteStateExists()
+		if err != nil {
+			return remoteSyncFile{}, fmt.Errorf("check empty remote state file: %w", err)
+		}
+		if !exists {
+			return remoteSyncFile{}, nil
+		}
+	}
 	data, err := decodeSyncFile(stdout.Bytes())
 	if err != nil {
 		return remoteSyncFile{}, fmt.Errorf("invalid remote state file: %w", err)
@@ -789,6 +802,36 @@ func (s *syncState) readRemote() (remoteSyncFile, error) {
 		}
 	}
 	return remoteSyncFile{data: data, etag: etag, exists: true}, nil
+}
+
+func (s *syncState) remoteStateExists() (bool, error) {
+	parent, _, err := resolveRemoteSyncFile(s.paths.remote, "..")
+	if err != nil {
+		return false, err
+	}
+	remote, err := parseRemote(s.paths.remote)
+	if err != nil {
+		return false, err
+	}
+	name := path.Base(s.paths.remote[remote.colon+1:])
+	var stdout, stderr bytes.Buffer
+	args := []string{"lsjson", parent, "--max-depth", "1", "--include", "/" + literalFilterPath(name)}
+	if err := s.runner.Run(args, &stdout, &stderr); err != nil {
+		if isRcloneNotFound(err) {
+			return false, nil
+		}
+		return false, commandError(err, stderr.String())
+	}
+	var entries []struct{ Path string }
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		return false, fmt.Errorf("decode remote state listing: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Path == name {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *syncState) writeRemote(data syncFileData, previousETag string) error {
