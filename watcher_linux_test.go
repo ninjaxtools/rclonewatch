@@ -18,7 +18,7 @@ func TestWatcherRebuildsCoverageAfterOverflow(t *testing.T) {
 	}
 	// Construct the watcher without a read goroutine to deterministically drop
 	// directory events, as would happen when the kernel queue overflows.
-	w := &watcher{root: root, fd: -1, events: make(chan change, 4096), errors: make(chan error, 1), stop: make(chan struct{}), done: make(chan struct{})}
+	w := &watcher{root: root, fd: -1, events: make(chan change, 4096), errors: make(chan error, 1), done: make(chan struct{})}
 	if err := w.rebuild(); err != nil {
 		t.Fatal(err)
 	}

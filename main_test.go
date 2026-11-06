@@ -220,19 +220,6 @@ func TestRcloneCommandCancel(t *testing.T) {
 	}
 }
 
-func TestRemotePath(t *testing.T) {
-	tests := map[string]string{
-		"remote:":       "remote:path/to/file",
-		"remote:backup": "remote:backup/path/to/file",
-		"/tmp/backup/":  "/tmp/backup/path/to/file",
-	}
-	for root, want := range tests {
-		if got := remotePath(root, "path/to/file"); got != want {
-			t.Errorf("remotePath(%q) = %q, want %q", root, got, want)
-		}
-	}
-}
-
 func TestAddPendingKeepsTypeChangesScoped(t *testing.T) {
 	pending := make(map[string]change)
 	addPending(pending, change{path: "item", removed: true})

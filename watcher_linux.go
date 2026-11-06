@@ -31,11 +31,16 @@ type change struct {
 }
 
 type watcher struct {
-	root   string
+	root string
+	// fd is the raw inotify descriptor used for watch management; file owns
+	// it and performs blocking reads through the runtime poller. Both are
+	// replaced only by the read loop, under mu so Close can wake it.
 	fd     int
+	file   *os.File
+	mu     sync.Mutex
+	closed bool
 	events chan change
 	errors chan error
-	stop   chan struct{}
 	done   chan struct{}
 	once   sync.Once
 
@@ -53,7 +58,6 @@ func newWatcher(root string) (*watcher, error) {
 		fd:           -1,
 		events:       make(chan change, 4096),
 		errors:       make(chan error, 1),
-		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
 		byDescriptor: make(map[int]string),
 		byPath:       make(map[string]int),
@@ -82,10 +86,18 @@ func (w *watcher) rebuild() error {
 		syscall.Close(fd)
 		return errors.New("source folder is no longer a directory")
 	}
-	oldFD := w.fd
-	w.fd, w.byDescriptor, w.byPath = fd, replacement.byDescriptor, replacement.byPath
-	if oldFD >= 0 {
-		syscall.Close(oldFD)
+	// The descriptor is non-blocking, so os.NewFile registers it with the
+	// runtime poller: reads park the goroutine and honor read deadlines.
+	file := os.NewFile(uintptr(fd), "inotify")
+	w.mu.Lock()
+	oldFile := w.file
+	w.fd, w.file, w.byDescriptor, w.byPath = fd, file, replacement.byDescriptor, replacement.byPath
+	if w.closed {
+		file.SetReadDeadline(time.Unix(1, 0))
+	}
+	w.mu.Unlock()
+	if oldFile != nil {
+		oldFile.Close()
 	}
 	return nil
 }
@@ -93,8 +105,17 @@ func (w *watcher) rebuild() error {
 func (w *watcher) Events() <-chan change { return w.events }
 func (w *watcher) Errors() <-chan error  { return w.errors }
 
+// Close stops watching. Events already queued by the kernel are still
+// delivered before the events channel closes.
 func (w *watcher) Close() {
-	w.once.Do(func() { close(w.stop) })
+	w.once.Do(func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.closed = true
+		// An expired deadline lets the reader drain readable events and then
+		// return instead of blocking.
+		w.file.SetReadDeadline(time.Unix(1, 0))
+	})
 }
 
 func (w *watcher) addTree(root string, emit bool) error {
@@ -111,9 +132,7 @@ func (w *watcher) addTree(root string, emit bool) error {
 			}
 		}
 		if emit && path != w.root {
-			if !w.send(change{path: w.relative(path), isDir: entry.IsDir()}) {
-				return filepath.SkipAll
-			}
+			w.send(change{path: w.relative(path), isDir: entry.IsDir()})
 		}
 		return nil
 	})
@@ -150,9 +169,8 @@ func (w *watcher) relative(path string) string {
 	return filepath.ToSlash(relative)
 }
 
-func (w *watcher) send(item change) bool {
+func (w *watcher) send(item change) {
 	w.events <- item
-	return true
 }
 
 func (w *watcher) fail(err error) {
@@ -166,49 +184,65 @@ func (w *watcher) readLoop() {
 	defer close(w.done)
 	defer close(w.events)
 	defer close(w.errors)
-	defer func() { syscall.Close(w.fd) }()
+	defer func() { w.file.Close() }()
 
 	buffer := make([]byte, 64*1024)
-	// unsafe.Sizeof includes tail padding for InotifyEvent.Name on newer Go
-	// versions, while the kernel ABI header is always SizeofInotifyEvent.
-	headerSize := syscall.SizeofInotifyEvent
-	stopping := false
 	for {
-		select {
-		case <-w.stop:
-			stopping = true
-		default:
-		}
-
-		count, err := syscall.Read(w.fd, buffer)
-		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR) {
-				if stopping && errors.Is(err, syscall.EAGAIN) {
+		count, err := w.file.Read(buffer)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			// Close was requested. The poller refuses reads after the deadline,
+			// so drain already queued events directly until none remain.
+			for {
+				count, err := syscall.Read(w.fd, buffer)
+				if errors.Is(err, syscall.EINTR) {
+					continue
+				}
+				if errors.Is(err, syscall.EAGAIN) {
 					return
 				}
-				time.Sleep(20 * time.Millisecond)
-				continue
+				if err != nil {
+					w.fail(fmt.Errorf("read inotify events: %w", err))
+					return
+				}
+				if !w.process(buffer[:count]) {
+					return
+				}
 			}
+		}
+		if err != nil {
 			w.fail(fmt.Errorf("read inotify events: %w", err))
 			return
 		}
-		for offset := 0; offset+headerSize <= count; {
-			event := (*syscall.InotifyEvent)(unsafe.Pointer(&buffer[offset]))
-			size := headerSize + int(event.Len)
-			if size < headerSize || offset+size > count {
-				w.fail(fmt.Errorf("truncated inotify event: read=%d offset=%d event-size=%d name-size=%d", count, offset, size, event.Len))
-				return
-			}
-			name := string(bytes.TrimRight(buffer[offset+headerSize:offset+size], "\x00"))
-			fd := w.fd
-			w.handle(int(event.Wd), event.Mask, name)
-			if w.fd != fd {
-				// Everything remaining in this buffer belongs to the old watches.
-				break
-			}
-			offset += size
+		if !w.process(buffer[:count]) {
+			return
 		}
 	}
+}
+
+// process handles one read of inotify events and reports whether reading
+// should continue.
+func (w *watcher) process(buffer []byte) bool {
+	// unsafe.Sizeof includes tail padding for InotifyEvent.Name on newer Go
+	// versions, while the kernel ABI header is always SizeofInotifyEvent.
+	headerSize := syscall.SizeofInotifyEvent
+	count := len(buffer)
+	for offset := 0; offset+headerSize <= count; {
+		event := (*syscall.InotifyEvent)(unsafe.Pointer(&buffer[offset]))
+		size := headerSize + int(event.Len)
+		if size < headerSize || offset+size > count {
+			w.fail(fmt.Errorf("truncated inotify event: read=%d offset=%d event-size=%d name-size=%d", count, offset, size, event.Len))
+			return false
+		}
+		name := string(bytes.TrimRight(buffer[offset+headerSize:offset+size], "\x00"))
+		file := w.file
+		w.handle(int(event.Wd), event.Mask, name)
+		if w.file != file {
+			// Everything remaining in this buffer belongs to the old watches.
+			break
+		}
+		offset += size
+	}
+	return true
 }
 
 func (w *watcher) handle(descriptor int, mask uint32, name string) {

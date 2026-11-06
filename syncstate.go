@@ -21,6 +21,13 @@ var (
 	errLockOwnershipLost = errors.New("remote state file ownership was lost")
 )
 
+// lockInterruptedError records the signal that interrupted lock acquisition so
+// the process can exit with the conventional 128+signal status.
+type lockInterruptedError struct{ signal os.Signal }
+
+func (e lockInterruptedError) Error() string        { return errLockInterrupted.Error() }
+func (e lockInterruptedError) Is(target error) bool { return target == errLockInterrupted }
+
 const (
 	lockPollInterval     = time.Second
 	localStateTempPrefix = ".rcw-tmp-"
@@ -65,6 +72,10 @@ type syncState struct {
 	excludes                   []string
 	forceDeleteUntrackedRemote bool
 	cancelCommands             func()
+	// releaseRunner, when set, replaces runner for the final lock release.
+	// The main runner may have been cancelled to abort in-flight work, which
+	// must not also prevent clearing a lock this process still owns.
+	releaseRunner commandRunner
 
 	mu            sync.Mutex
 	updateMu      sync.Mutex
@@ -178,11 +189,9 @@ func (s *syncState) Acquire(interrupt <-chan os.Signal) error {
 			}
 			timer := time.NewTimer(max(time.Until(wakeAt), 0))
 			select {
-			case <-interrupt:
-				if !timer.Stop() {
-					<-timer.C
-				}
-				return errLockInterrupted
+			case sig := <-interrupt:
+				timer.Stop()
+				return lockInterruptedError{sig}
 			case <-timer.C:
 			}
 			remote, err = s.readRemote()
@@ -304,11 +313,9 @@ func (s *syncState) verifyAcquiredLock(deadline time.Time, interrupt <-chan os.S
 		}
 		timer := time.NewTimer(min(s.pollInterval, remaining))
 		select {
-		case <-interrupt:
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return remoteSyncFile{}, errLockInterrupted
+		case sig := <-interrupt:
+			timer.Stop()
+			return remoteSyncFile{}, lockInterruptedError{sig}
 		case <-timer.C:
 		}
 	}
@@ -483,6 +490,9 @@ func (s *syncState) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.stop)
 		<-s.done
+		if s.releaseRunner != nil {
+			s.runner = s.releaseRunner
+		}
 		if s.persistent {
 			if s.logs {
 				s.logger.Printf("persistent remote lock retained")
@@ -699,12 +709,14 @@ func (s *syncState) deleteRemotePayload() error {
 
 func (s *syncState) remotePayloadEmpty() (bool, error) {
 	var stdout, stderr bytes.Buffer
-	if err := s.runner.Run([]string{"lsjson", s.dest, "--recursive"}, &stdout, &stderr); err != nil {
+	if err := s.runner.Run([]string{"lsjson", s.dest, "--max-depth", "1"}, &stdout, &stderr); err != nil {
 		if isRcloneNotFound(err) {
 			return true, nil
 		}
 		return false, commandError(err, stderr.String())
 	}
+	// Any top-level entry makes the destination non-empty; a recursive listing
+	// would walk an arbitrarily large untracked tree for the same answer.
 	var entries []json.RawMessage
 	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
 		return false, fmt.Errorf("decode remote listing: %w", err)

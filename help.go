@@ -89,7 +89,9 @@ Wrapped command:
   passes through its standard input, output, and error, watches until it exits,
   then drains events, performs a final sync, and returns the command's status
   if syncing succeeds. SIGINT and SIGTERM are forwarded to the command, whose
-  exit is awaited before final shutdown.
+  exit is awaited before final shutdown. When standard input is the terminal,
+  the command is given the foreground so it can read input; Ctrl-C reaches it
+  directly, and Ctrl-Z suspends the whole job until it is resumed.
 
 Watching and payload transfers:
   A symlink source root is resolved before watching. Watches are installed before
@@ -154,7 +156,8 @@ Shutdown and retries:
   active rclone work and the wrapped command are terminated without a final
   sync. SIGINT or SIGTERM drains queued inotify events, performs a final sync,
   clears an owned non-persistent lock, and exits. Runtime failures use status 1
-  and usage errors status 2.
+  and usage errors status 2. A signal while waiting for a remote lock exits with
+  128 plus the signal number without running the command.
 
 Examples:
   # Wrap a command, periodically sync, and retain a reusable lock.

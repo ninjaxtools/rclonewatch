@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1266,8 +1267,48 @@ func TestSyncStateWaitCanBeInterrupted(t *testing.T) {
 	interrupt := make(chan os.Signal, 1)
 	interrupt <- os.Interrupt
 	state, _ := newMemoryState(t, runner, time.Hour, lockWait{infinite: true}, false, false)
-	if err := state.Acquire(interrupt); !errors.Is(err, errLockInterrupted) {
+	err := state.Acquire(interrupt)
+	if !errors.Is(err, errLockInterrupted) {
 		t.Fatalf("Acquire error = %v, want errLockInterrupted", err)
+	}
+	var interrupted lockInterruptedError
+	if !errors.As(err, &interrupted) || interrupted.signal != os.Interrupt {
+		t.Fatalf("Acquire error = %#v, want the interrupting signal", err)
+	}
+	if code := signalExitCode(interrupted.signal); code != 130 {
+		t.Fatalf("interrupt exit code = %d, want 130", code)
+	}
+}
+
+type cancellableRunner struct {
+	runner    commandRunner
+	cancelled atomic.Bool
+}
+
+func (r *cancellableRunner) Run(args []string, stdout, stderr io.Writer) error {
+	if r.cancelled.Load() {
+		return errors.New("context canceled")
+	}
+	return r.runner.Run(args, stdout, stderr)
+}
+
+func TestSyncStateCloseReleasesLockAfterCommandsWereCancelled(t *testing.T) {
+	memory := &memorySyncRunner{}
+	memory.setData(syncFileData{Generation: 1})
+	state, _ := newMemoryState(t, memory, time.Hour, lockWait{}, false, false)
+	runner := &cancellableRunner{runner: memory}
+	state.runner = runner
+	state.releaseRunner = memory
+	if err := state.Acquire(make(chan os.Signal)); err != nil {
+		t.Fatal(err)
+	}
+	state.Start()
+	runner.cancelled.Store(true)
+	if err := state.Close(); err != nil {
+		t.Fatalf("Close after cancellation: %v", err)
+	}
+	if lock := memory.data(t).Lock; lock != nil {
+		t.Fatalf("lock was not released: %#v", lock)
 	}
 }
 

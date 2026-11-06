@@ -176,13 +176,6 @@ func (s *syncer) run(args ...string) error {
 	return s.runner.Run(args, output, output)
 }
 
-func remotePath(root, relative string) string {
-	if strings.HasSuffix(root, ":") {
-		return root + relative
-	}
-	return strings.TrimRight(root, "/") + "/" + relative
-}
-
 type syncResult struct {
 	batch map[string]change
 	err   error
@@ -213,6 +206,13 @@ func commandExitCode(err error) int {
 	}
 	if status, ok := exitError.Sys().(syscall.WaitStatus); ok && status.Signaled() {
 		return 128 + int(status.Signal())
+	}
+	return 1
+}
+
+func signalExitCode(sig os.Signal) int {
+	if number, ok := sig.(syscall.Signal); ok {
+		return 128 + int(number)
 	}
 	return 1
 }
@@ -290,9 +290,16 @@ func run(cfg config) (exitCode int) {
 		state.excludes = append([]string(nil), cfg.excludes...)
 		state.forceDeleteUntrackedRemote = cfg.forceDeleteRemote
 		state.cancelCommands = runner.Cancel
+		// Cancelling runner aborts in-flight work permanently; releasing a
+		// lock that is still owned must remain possible afterwards.
+		state.releaseRunner = newRcloneCommand()
 		if err := state.Acquire(signals); err != nil {
-			if errors.Is(err, errLockInterrupted) {
-				return 0
+			// An interrupted wait must not look like a successful run,
+			// especially when the wrapped command never started.
+			var interrupted lockInterruptedError
+			if errors.As(err, &interrupted) {
+				logger.Printf("%v", err)
+				return signalExitCode(interrupted.signal)
 			}
 			logger.Printf("acquire lock: %v", err)
 			return 1
@@ -319,11 +326,19 @@ func run(cfg config) (exitCode int) {
 	pending := make(map[string]change)
 	if state != nil {
 		if err := initializeWatching(state, watcher, pending); err != nil {
+			// A failed lock refresh cancels startup work; report the cause
+			// rather than the resulting cancellation.
+			select {
+			case lockErr := <-lockErrors:
+				if lockErr != nil {
+					logger.Printf("lock refresh failed during startup sync: %v", lockErr)
+					return 1
+				}
+			default:
+			}
 			logger.Printf("initialize generation: %v", err)
 			return 1
 		}
-	}
-	if state != nil {
 		select {
 		case err := <-lockErrors:
 			if err != nil {
@@ -346,10 +361,14 @@ func run(cfg config) (exitCode int) {
 	}
 
 	var wrapped *exec.Cmd
-	var commandDone <-chan error
+	var commandDone <-chan int
 	if len(cfg.command) > 0 {
 		wrapped = exec.Command(cfg.command[0], cfg.command[1:]...)
 		wrapped.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		tty, foreground := foregroundTerminal()
+		if foreground {
+			tty.configure(wrapped)
+		}
 		wrapped.Stdin = os.Stdin
 		wrapped.Stdout = os.Stdout
 		wrapped.Stderr = os.Stderr
@@ -358,9 +377,14 @@ func run(cfg config) (exitCode int) {
 			logger.Printf("start wrapped command: %v", err)
 			return 1
 		}
-		done := make(chan error, 1)
+		done := make(chan int, 1)
 		commandDone = done
-		go func() { done <- wrapped.Wait() }()
+		if foreground {
+			tty.started()
+			go func() { done <- tty.wait(wrapped) }()
+		} else {
+			go func() { done <- commandExitCode(wrapped.Wait()) }()
+		}
 	}
 
 	if cfg.logs {
@@ -501,7 +525,12 @@ func run(cfg config) (exitCode int) {
 				}
 				if !stopping {
 					syncReady = false
-					timer.Reset(retryDelay)
+					if timer == nil {
+						timer = time.NewTimer(retryDelay)
+						defer timer.Stop()
+					} else {
+						timer.Reset(retryDelay)
+					}
 					timerC = timer.C
 					retryDelay *= 2
 					if retryDelay > maxRetryDelay {
@@ -510,15 +539,15 @@ func run(cfg config) (exitCode int) {
 				}
 			} else {
 				retryDelay = initialRetryDelay
-				if !stopping && timer != nil {
+				if !stopping && cfg.interval > 0 {
 					syncReady = false
 					timer.Reset(cfg.interval)
 					timerC = timer.C
 				}
 			}
-		case err := <-commandDone:
+		case code := <-commandDone:
 			commandDone = nil
-			wrappedExitCode = commandExitCode(err)
+			wrappedExitCode = code
 			if cfg.logs {
 				logger.Printf("wrapped command exited with status %d", wrappedExitCode)
 			}
